@@ -33,6 +33,7 @@
   },
   "scripts": {
     "build": "tsup --config tsup.config.ts",
+    "prepublishOnly": "pnpm run build",
     "test": "tsx --test \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit"
   },
