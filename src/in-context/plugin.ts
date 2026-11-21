@@ -6,7 +6,10 @@ const PREFIX = '[@localize-work/i18next-backend/in-context]';
 export const POST_PROCESSOR_NAME = 'localizeInContext';
 export const DEFAULT_EDITOR_URL = 'https://app.localize.work';
 export const DEFAULT_QUERY_PARAMETER = 'localize';
-/** sessionStorage key that keeps editing on while the tab navigates. */
+/**
+ * sessionStorage key that remembers the visitor's choice while the tab
+ * navigates: '1' after `?localize=edit`, '0' after Exit or `?localize=off`.
+ */
 export const SESSION_FLAG = 'localize-work:in-context';
 
 export interface LocalizeInContextOptions {
@@ -17,7 +20,9 @@ export interface LocalizeInContextOptions {
   /**
    * Whether editing is on. By default it turns on when the page is opened
    * with `?localize=edit` and stays on for that browser tab. Pass `false` to
-   * switch the feature off entirely (e.g. in production), or `true` to force it.
+   * switch the feature off entirely (e.g. in production). Pass `true` to have
+   * it on without the parameter; Exit and `?localize=off` still turn it off
+   * for the tab, and `?localize=edit` turns it back on.
    */
   enabled?: boolean;
   /** The query parameter that turns editing on. Defaults to `localize`. */
@@ -32,19 +37,25 @@ interface ResolvedInContextOptions {
 
 const PLURAL_SUFFIX = /_(zero|one|two|few|many|other)$/;
 
-/** Whether editing is on for this page load, from the URL or the tab's memory. */
-function enabledByVisitor(queryParameter: string): boolean {
-  if (typeof window === 'undefined') return false;
+/**
+ * What the visitor chose for this tab: the address parameter, else what the
+ * tab remembers from an earlier page. null when they chose nothing.
+ */
+function visitorChoice(queryParameter: string): 'on' | 'off' | null {
+  if (typeof window === 'undefined') return null;
   const value = new URLSearchParams(window.location.search).get(queryParameter);
+  const fromAddress = value === 'edit' ? 'on' : value === 'off' ? 'off' : null;
   try {
-    if (value === 'edit') window.sessionStorage.setItem(SESSION_FLAG, '1');
-    else if (value === 'off') window.sessionStorage.removeItem(SESSION_FLAG);
-    else return window.sessionStorage.getItem(SESSION_FLAG) === '1';
+    if (fromAddress === null) {
+      const remembered = window.sessionStorage.getItem(SESSION_FLAG);
+      return remembered === '1' ? 'on' : remembered === '0' ? 'off' : null;
+    }
+    window.sessionStorage.setItem(SESSION_FLAG, fromAddress === 'on' ? '1' : '0');
   } catch {
     // Storage can be blocked; the query parameter alone then decides, and
-    // editing lasts for this page instead of the whole tab.
+    // the choice lasts for this page instead of the whole tab.
   }
-  return value === 'edit';
+  return fromAddress;
 }
 
 function resolveOptions(instance: i18n): ResolvedInContextOptions | null {
@@ -53,7 +64,9 @@ function resolveOptions(instance: i18n): ResolvedInContextOptions | null {
   const options = raw ?? {};
   if (options.enabled === false) return null;
   const queryParameter = options.queryParameter ?? DEFAULT_QUERY_PARAMETER;
-  const enabled = options.enabled ?? enabledByVisitor(queryParameter);
+  const choice = visitorChoice(queryParameter);
+  // `enabled: true` is on unless the visitor left; otherwise on when they asked.
+  const enabled = options.enabled === true ? choice !== 'off' : choice === 'on';
   if (!enabled) return null;
 
   const backend = instance.options.backend as { projectSlug?: unknown } | undefined;
@@ -75,9 +88,30 @@ function resolveOptions(instance: i18n): ResolvedInContextOptions | null {
 }
 
 interface ResolvedTranslation {
+  /** The text i18next found; undefined when it found none. */
+  res?: unknown;
   usedKey?: string;
   exactUsedKey?: string;
   usedNS?: string;
+  usedLng?: string;
+}
+
+/**
+ * The suffixes i18next adds to a key for this count: the plural form of the
+ * language (`_other`), and `_zero` for a count of 0. null when this i18next
+ * cannot say.
+ */
+function pluralSuffixes(instance: i18n, language: string, count: number): string[] | null {
+  const separator = instance.options.pluralSeparator ?? '_';
+  try {
+    const resolver = (instance.services as { pluralResolver?: unknown } | undefined)
+      ?.pluralResolver as { getSuffix?: (code: string, count: number) => unknown } | undefined;
+    const suffix = resolver?.getSuffix?.(language, count);
+    if (typeof suffix !== 'string' || suffix === '') return null;
+    return count === 0 ? [suffix, `${separator}zero`] : [suffix];
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -98,8 +132,12 @@ export function keyOf(
   if (typeof asked !== 'string' || asked === '') return null;
 
   const nsSeparator = instance.options.nsSeparator ?? ':';
-  let namespace = resolved?.usedNS;
-  let key = resolved?.exactUsedKey ?? resolved?.usedKey;
+  // i18next names the last key and namespace it tried even when it found
+  // nothing, and that namespace can be a fallback one. Trust them only for a
+  // text that was found.
+  const found = resolved !== undefined && resolved.res !== undefined;
+  let namespace = found ? resolved.usedNS : undefined;
+  let key = found ? (resolved.exactUsedKey ?? resolved.usedKey) : undefined;
 
   if (key === undefined) {
     // Nothing was found (the fallback text is showing): name the key asked for.
@@ -111,12 +149,21 @@ export function keyOf(
     }
   } else if (
     typeof options.count === 'number' &&
+    !options.ordinal &&
     resolved?.exactUsedKey !== undefined &&
     resolved.exactUsedKey !== resolved.usedKey
   ) {
-    // i18next read a suffixed resource for a shorter key: the suffix is the
-    // plural form, not part of the name.
-    key = key.replace(PLURAL_SUFFIX, '');
+    // i18next read a suffixed resource for a shorter key. The suffix is the
+    // plural form only when it is the one i18next adds for this count; with a
+    // context it can be the context instead (`stage_one` for context "one").
+    const language = resolved.usedLng ?? instance.resolvedLanguage ?? instance.language;
+    const suffixes = pluralSuffixes(instance, language, options.count);
+    if (suffixes === null) {
+      key = key.replace(PLURAL_SUFFIX, '');
+    } else {
+      const suffix = suffixes.find((candidate) => key!.endsWith(candidate));
+      if (suffix !== undefined) key = key.slice(0, -suffix.length);
+    }
   }
 
   if (namespace === undefined) {
@@ -191,12 +238,15 @@ export const LocalizeInContext: ThirdPartyModule = {
 
 /** Turn editing off for this tab and reload the page without markers. */
 export function exitInContext(queryParameter = DEFAULT_QUERY_PARAMETER): void {
-  try {
-    window.sessionStorage.removeItem(SESSION_FLAG);
-  } catch {
-    // Nothing to clear when storage is blocked.
-  }
   const url = new URL(window.location.href);
-  url.searchParams.delete(queryParameter);
+  try {
+    // Remembered as a choice, so that `enabled: true` does not turn editing
+    // straight back on when the page reloads.
+    window.sessionStorage.setItem(SESSION_FLAG, '0');
+    url.searchParams.delete(queryParameter);
+  } catch {
+    // Storage is blocked: the address has to carry the choice.
+    url.searchParams.set(queryParameter, 'off');
+  }
   window.location.replace(url.toString());
 }

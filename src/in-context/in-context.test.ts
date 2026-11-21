@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createInstance, type i18n } from 'i18next';
-import { JSDOM } from 'jsdom';
+import { JSDOM, VirtualConsole } from 'jsdom';
 import {
   encodeMarker,
   findMarkers,
@@ -11,7 +11,7 @@ import {
   stripMarkers,
 } from './markers.js';
 import { applySavedValues, findHit, MESSAGE_SOURCE, resourceKey, startOverlay } from './overlay.js';
-import { LocalizeInContext, SESSION_FLAG } from './plugin.js';
+import { exitInContext, keyOf, LocalizeInContext, SESSION_FLAG } from './plugin.js';
 
 const resources = {
   en: {
@@ -22,6 +22,7 @@ const resources = {
       items_other: '{{count}} items',
       friend_male: 'A boyfriend',
       season_one: 'Season one',
+      stage_one: 'Stage one',
       nested: 'See $t(title)',
       nav: { home: 'Home' },
     },
@@ -130,6 +131,9 @@ test('a marker names the project key, not the resource i18next happened to read'
   const male = i18next.t('friend', { context: 'male' });
   assert.equal(stripMarkers(male), 'A boyfriend');
   assert.deepEqual(ids(male), ids(i18next.t('friend_male')));
+  // A context that reads like a plural form is still the context: with a
+  // count of 2 the plural suffix would be "_other", so "_one" is not it.
+  assert.deepEqual(ids(i18next.t('stage', { context: 'one', count: 2 })), ids(i18next.t('stage_one')));
   // A call that names its language is a different thing to edit.
   assert.notDeepEqual(ids(i18next.t('title', { lng: 'et' })), ids(i18next.t('title')));
   assert.equal(stripMarkers(i18next.t('title', { lng: 'et' })), 'Tere tulemast');
@@ -165,6 +169,39 @@ test('the plugin stays off, with a warning, when it cannot tell the project', as
   } finally {
     console.warn = original;
   }
+});
+
+test('a key that is not found is named in the namespace that was asked for', async () => {
+  const seen: unknown[] = [];
+  const i18next = createInstance();
+  await i18next
+    .use({
+      type: 'postProcessor',
+      name: 'capture',
+      process(value: string, key: string | string[], options: never) {
+        const target = keyOf(key, options, i18next);
+        seen.push(target && { namespace: target.namespace, key: target.key });
+        return value;
+      },
+    })
+    .init({
+      lng: 'en',
+      ns: ['common', 'billing'],
+      defaultNS: 'common',
+      // i18next tries the fallback namespace last and reports it as "used".
+      fallbackNS: 'billing',
+      resources,
+      postProcess: ['capture'],
+      postProcessPassResolved: true,
+    });
+  i18next.t('newKey');
+  i18next.t('billing:other.new');
+  i18next.t('title');
+  assert.deepEqual(seen, [
+    { namespace: 'common', key: 'newKey' },
+    { namespace: 'billing', key: 'other.new' },
+    { namespace: 'common', key: 'title' },
+  ]);
 });
 
 // ---------------------------------------------------------------- overlay
@@ -445,7 +482,11 @@ test('saved values are stored under i18next resource names', async () => {
 });
 
 test('opening the page with ?localize=edit turns editing on for the tab', async () => {
-  const dom = new JSDOM('<!doctype html><body></body>', { url: 'https://shop.example/?localize=edit' });
+  const dom = new JSDOM('<!doctype html><body></body>', {
+    url: 'https://shop.example/?localize=edit',
+    // Exit reloads the page, which jsdom reports as not implemented.
+    virtualConsole: new VirtualConsole(),
+  });
   const saved = new Map<string, unknown>();
   for (const name of GLOBALS) {
     saved.set(name, (globalThis as Record<string, unknown>)[name]);
@@ -463,7 +504,22 @@ test('opening the page with ?localize=edit turns editing on for the tab', async 
     // ?localize=off ends it.
     dom.reconfigure({ url: 'https://shop.example/cart?localize=off' });
     assert.equal(hasMarker((await instance()).t('title')), false);
-    assert.equal(dom.window.sessionStorage.getItem(SESSION_FLAG), null);
+    assert.equal(dom.window.sessionStorage.getItem(SESSION_FLAG), '0');
+    dom.reconfigure({ url: 'https://shop.example/cart' });
+    assert.equal(hasMarker((await instance()).t('title')), false);
+
+    // `enabled: true` is on without the parameter, but Exit must still end
+    // it: the choice is remembered, so the reload does not turn it back on.
+    dom.window.sessionStorage.clear();
+    const forced = { localizeInContext: { enabled: true } };
+    assert.equal(hasMarker((await instance(forced)).t('title')), true);
+    exitInContext();
+    assert.equal(dom.window.sessionStorage.getItem(SESSION_FLAG), '0');
+    assert.equal(hasMarker((await instance(forced)).t('title')), false);
+    dom.reconfigure({ url: 'https://shop.example/cart?localize=edit' });
+    assert.equal(hasMarker((await instance(forced)).t('title')), true);
+    dom.reconfigure({ url: 'https://shop.example/cart?localize=off' });
+    assert.equal(hasMarker((await instance(forced)).t('title')), false);
 
     // With storage blocked, the parameter still turns editing on for the page.
     Object.defineProperty(dom.window, 'sessionStorage', {

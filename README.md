@@ -105,7 +105,7 @@ the address. From then on, in that browser tab:
 
 | Option (`localizeInContext`) | Default | Meaning |
 |---|---|---|
-| `enabled` | on with `?localize=edit` | `false` switches the feature off entirely, e.g. in production. `true` forces it on. |
+| `enabled` | on with `?localize=edit` | `false` switches the feature off entirely, e.g. in production. `true` turns it on without the parameter; Exit and `?localize=off` still turn it off for the tab. |
 | `projectSlug` | `backend.projectSlug` | The project to open in the editor. |
 | `editorUrl` | `https://app.localize.work` | Where the editor runs. |
 | `queryParameter` | `localize` | The address parameter that turns editing on. |
