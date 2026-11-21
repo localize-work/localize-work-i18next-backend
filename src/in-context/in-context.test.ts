@@ -190,6 +190,10 @@ test('a marker names the project key, not the resource i18next happened to read'
   // A call that names its language is a different thing to edit.
   assert.notDeepEqual(ids(i18next.t('title', { lng: 'et' })), ids(i18next.t('title')));
   assert.equal(stripMarkers(i18next.t('title', { lng: 'et' })), 'Tere tulemast');
+  // So is a call fixed to a list of languages: it asks for the first of them.
+  const listed = i18next.getFixedT(['et', 'en'], 'common')('title');
+  assert.equal(stripMarkers(listed), 'Tere tulemast');
+  assert.deepEqual(ids(listed), ids(i18next.t('title', { lng: 'et' })));
 });
 
 test('an existing postProcess setting is kept', async () => {

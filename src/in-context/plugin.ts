@@ -182,8 +182,12 @@ export function keyOf(
   }
   if (key === '') return null;
   // A call that names its language (`t(key, { lng })`) shows that language,
-  // whatever the app's own language is.
-  const language = typeof options.lng === 'string' && options.lng !== '' ? options.lng : undefined;
+  // whatever the app's own language is. A list of languages
+  // (`getFixedT(['fr', 'en'])`) asks for its first one; i18next reads the
+  // list and ignores `lng` when both are set, so the list comes first here too.
+  const listed: unknown = Array.isArray(options.lngs) ? options.lngs[0] : undefined;
+  const named = typeof listed === 'string' && listed !== '' ? listed : options.lng;
+  const language = typeof named === 'string' && named !== '' ? named : undefined;
   return language ? { namespace, key, language } : { namespace, key };
 }
 
