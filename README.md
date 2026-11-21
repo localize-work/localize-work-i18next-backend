@@ -70,6 +70,67 @@ standard.
 | `loadPath` | `string \| (lng, ns) => string` | — | Escape hatch replacing the whole CDN URL. String form supports `{{lng}}` and `{{ns}}` placeholders. |
 | `onFailedLoad` | `(info: FailedLoadInfo) => void` | — | Observability hook; fires on every failed CDN load **including sparse 404s** (`info.status === 404`). Never changes load behavior. |
 
+## In-context editing
+
+Translators can edit a string by clicking it in the running app. Add the
+in-context plugin next to the backend:
+
+```ts
+import LocalizeBackend from '@localize-work/i18next-backend';
+import { LocalizeInContext } from '@localize-work/i18next-backend/in-context';
+
+await i18next
+  .use(LocalizeBackend)
+  .use(LocalizeInContext)
+  .use(initReactI18next)
+  .init({
+    // ...
+    backend: { projectSlug: 'your-project', cdnBaseUrl: 'https://cdn.localize.work' },
+  });
+```
+
+The plugin does nothing until someone opens the app with `?localize=edit` in
+the address. From then on, in that browser tab:
+
+- every translated string ends with an invisible marker that names its key;
+- a toolbar appears, and hovering text outlines it and shows its key;
+- clicking text opens that key in the localize.work editor, in a separate
+  window. The person signs in there as usual.
+- text saved in the editor appears on the page at once, without a reload. It
+  is a preview in that tab only: other visitors see it after it is reviewed
+  and published.
+
+**Pause** in the toolbar lets you use the app normally for a moment; **Exit**
+(or `?localize=off`) turns editing off.
+
+| Option (`localizeInContext`) | Default | Meaning |
+|---|---|---|
+| `enabled` | on with `?localize=edit` | `false` switches the feature off entirely, e.g. in production. `true` forces it on. |
+| `projectSlug` | `backend.projectSlug` | The project to open in the editor. |
+| `editorUrl` | `https://app.localize.work` | Where the editor runs. |
+| `queryParameter` | `localize` | The address parameter that turns editing on. |
+
+```ts
+i18next.init({
+  // ...
+  localizeInContext: { enabled: import.meta.env.MODE !== 'production' },
+});
+```
+
+Things to know:
+
+- While editing is on, translated strings contain invisible characters. Code
+  that compares a translated string, measures its length or sends it somewhere
+  should clean it first with `stripMarkers(text)` from the same module.
+- Text in an element's content and in `placeholder`, `title`, `aria-label` and
+  `alt` attributes can be clicked. Text drawn another way (a canvas, the
+  document title) cannot.
+- With server rendering, turn editing on only in the browser; the server's
+  HTML has no markers, so React reports a hydration mismatch in editing mode.
+- The editor opens in its own window because it signs people in with a cookie
+  that browsers do not send to an embedded frame on another site. Allow
+  pop-ups for your app if the browser blocks it.
+
 ## Version pinning
 
 `version: 'latest'` (the default) follows the atomic pointer that moves on every

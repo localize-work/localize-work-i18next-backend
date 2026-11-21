@@ -1,8 +1,15 @@
 {
   "name": "@localize-work/i18next-backend",
-  "version": "0.9.0",
-  "description": "i18next backend plugin for localize.work — loads published translation JSON from the CDN and posts missing keys back to the API in development",
-  "keywords": ["i18next", "backend", "i18next-backend", "localization", "translation", "localize.work"],
+  "version": "0.10.0",
+  "description": "i18next backend plugin for localize.work — loads published translation JSON from the CDN, posts missing keys back to the API in development, and lets translators edit strings in the running app",
+  "keywords": [
+    "i18next",
+    "backend",
+    "i18next-backend",
+    "localization",
+    "translation",
+    "localize.work"
+  ],
   "license": "MIT",
   "homepage": "https://localize.work",
   "repository": {
@@ -25,9 +32,23 @@
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
       }
+    },
+    "./in-context": {
+      "import": {
+        "types": "./dist/in-context.d.ts",
+        "default": "./dist/in-context.js"
+      },
+      "require": {
+        "types": "./dist/in-context.d.cts",
+        "default": "./dist/in-context.cjs"
+      }
     }
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "publishConfig": {
     "access": "public"
   },
@@ -41,8 +62,10 @@
     "i18next": "^23.0.0 || ^24.0.0 || ^25.0.0 || ^26.0.0"
   },
   "devDependencies": {
+    "@types/jsdom": "^30.0.0",
     "@types/node": "^22.15.0",
     "i18next": "^26.3.6",
+    "jsdom": "^31.0.1",
     "tsup": "^8.5.0",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3"

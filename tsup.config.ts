@@ -1,7 +1,7 @@
 import { defineConfig } from 'tsup';
 
 export default defineConfig({
-  entry: ['src/index.ts'],
+  entry: ['src/index.ts', 'src/in-context.ts'],
   format: ['esm', 'cjs'],
   // Runs in browsers and Node alike — no platform-specific APIs beyond fetch.
   platform: 'neutral',
