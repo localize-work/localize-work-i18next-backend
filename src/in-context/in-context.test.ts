@@ -21,6 +21,7 @@ const resources = {
       items_one: '{{count}} item',
       items_other: '{{count}} items',
       friend_male: 'A boyfriend',
+      season_one: 'Season one',
       nested: 'See $t(title)',
       nav: { home: 'Home' },
     },
@@ -119,6 +120,21 @@ test('when on, every translated string carries a marker for the key it came from
   assert.deepEqual(ids(nav.home), ids(i18next.t('nav.home')));
 });
 
+test('a marker names the project key, not the resource i18next happened to read', async () => {
+  const i18next = await instance({ localizeInContext: { enabled: true } });
+  // An ordinary key whose name ends like a plural form keeps its name, even
+  // when the call passes a count.
+  assert.deepEqual(ids(i18next.t('season_one', { count: 1 })), ids(i18next.t('season_one')));
+  assert.notDeepEqual(ids(i18next.t('season_one')), ids(i18next.t('items', { count: 1 })));
+  // A context is part of the key's name.
+  const male = i18next.t('friend', { context: 'male' });
+  assert.equal(stripMarkers(male), 'A boyfriend');
+  assert.deepEqual(ids(male), ids(i18next.t('friend_male')));
+  // A call that names its language is a different thing to edit.
+  assert.notDeepEqual(ids(i18next.t('title', { lng: 'et' })), ids(i18next.t('title')));
+  assert.equal(stripMarkers(i18next.t('title', { lng: 'et' })), 'Tere tulemast');
+});
+
 test('an existing postProcess setting is kept', async () => {
   const i18next = createInstance();
   await i18next
@@ -175,7 +191,7 @@ const GLOBALS = [
 ] as const;
 
 /** A page with one marked heading and button, and the overlay running on it. */
-async function page(): Promise<Page> {
+async function page(language = 'et'): Promise<Page> {
   const dom = new JSDOM('<!doctype html><body></body>', {
     url: 'https://shop.example/cart',
     pretendToBeVisual: true,
@@ -189,13 +205,14 @@ async function page(): Promise<Page> {
   }
 
   const i18next = createInstance();
-  await i18next.init({ lng: 'et', fallbackLng: 'en', defaultNS: 'common', resources });
+  await i18next.init({ lng: language, fallbackLng: 'en', defaultNS: 'common', resources });
   const registry = new MarkerRegistry();
   const mark = (namespace: string, key: string) => encodeMarker(registry.id(namespace, key));
   dom.window.document.body.innerHTML = `
     <h1 id="title">Tere tulemast${mark('common', 'title')}</h1>
     <button id="pay"><span id="inner">Billing${mark('billing', 'title')}</span></button>
     <input id="search" placeholder="Search${mark('common', 'search')}">
+    <p id="other-language">Tere${encodeMarker(registry.id('common', 'title', 'et'))}</p>
     <p id="plain">No translation here</p>
     <div id="card"><section><h2>Cart${mark('common', 'cart')}</h2></section></div>`;
 
@@ -288,6 +305,21 @@ test('clicking translated text opens its key in the editor instead of acting on 
     // Text that is not a translation behaves normally.
     assert.equal(click(state, 'plain').defaultPrevented, false);
     assert.equal(state.opened.length, 3);
+  } finally {
+    state.stop();
+  }
+});
+
+test('the editor opens the language the app is set to, not the one a text fell back to', async () => {
+  // No en-GB resources: every text falls back to en.
+  const state = await page('en-GB');
+  try {
+    assert.equal(state.i18next.resolvedLanguage, 'en');
+    click(state, 'title');
+    assert.equal(new URL(state.opened[0]!).searchParams.get('locale'), 'en-GB');
+    // A text rendered with an explicit language opens that language.
+    click(state, 'other-language');
+    assert.equal(new URL(state.opened[1]!).searchParams.get('locale'), 'et');
   } finally {
     state.stop();
   }
@@ -432,6 +464,18 @@ test('opening the page with ?localize=edit turns editing on for the tab', async 
     dom.reconfigure({ url: 'https://shop.example/cart?localize=off' });
     assert.equal(hasMarker((await instance()).t('title')), false);
     assert.equal(dom.window.sessionStorage.getItem(SESSION_FLAG), null);
+
+    // With storage blocked, the parameter still turns editing on for the page.
+    Object.defineProperty(dom.window, 'sessionStorage', {
+      configurable: true,
+      get() {
+        throw new Error('storage is blocked');
+      },
+    });
+    dom.reconfigure({ url: 'https://shop.example/cart?localize=edit' });
+    assert.equal(hasMarker((await instance()).t('title')), true);
+    dom.reconfigure({ url: 'https://shop.example/cart' });
+    assert.equal(hasMarker((await instance()).t('title')), false);
   } finally {
     for (const name of GLOBALS) (globalThis as Record<string, unknown>)[name] = saved.get(name);
   }

@@ -35,21 +35,16 @@ const PLURAL_SUFFIX = /_(zero|one|two|few|many|other)$/;
 /** Whether editing is on for this page load, from the URL or the tab's memory. */
 function enabledByVisitor(queryParameter: string): boolean {
   if (typeof window === 'undefined') return false;
+  const value = new URLSearchParams(window.location.search).get(queryParameter);
   try {
-    const value = new URLSearchParams(window.location.search).get(queryParameter);
-    if (value === 'edit') {
-      window.sessionStorage.setItem(SESSION_FLAG, '1');
-      return true;
-    }
-    if (value === 'off') {
-      window.sessionStorage.removeItem(SESSION_FLAG);
-      return false;
-    }
-    return window.sessionStorage.getItem(SESSION_FLAG) === '1';
+    if (value === 'edit') window.sessionStorage.setItem(SESSION_FLAG, '1');
+    else if (value === 'off') window.sessionStorage.removeItem(SESSION_FLAG);
+    else return window.sessionStorage.getItem(SESSION_FLAG) === '1';
   } catch {
-    // Storage can be blocked; the query parameter alone then decides.
-    return false;
+    // Storage can be blocked; the query parameter alone then decides, and
+    // editing lasts for this page instead of the whole tab.
   }
+  return value === 'edit';
 }
 
 function resolveOptions(instance: i18n): ResolvedInContextOptions | null {
@@ -86,16 +81,18 @@ interface ResolvedTranslation {
 }
 
 /**
- * The project key a translated string came from. i18next reports the exact
- * resource it used, e.g. `items_other`; the project stores one key `items`
- * with a text per plural form, so a plural suffix is dropped when the call
- * passed a count. A context suffix (`friend_male`) is a key of its own.
+ * The project key a translated string came from. i18next reports the key it
+ * resolved (`usedKey`, e.g. `items`) and the exact resource it read
+ * (`exactUsedKey`, e.g. `items_other`). The project stores one key `items`
+ * with a text per plural form, so the plural suffix i18next added is dropped.
+ * A suffix that is part of the key's own name (`season_one`) is kept, and a
+ * context suffix (`friend_male`) is a key of its own.
  */
 export function keyOf(
   requestedKey: string | string[],
   options: TOptions & { i18nResolved?: ResolvedTranslation },
   instance: i18n,
-): { namespace: string; key: string } | null {
+): { namespace: string; key: string; language?: string } | null {
   const resolved = options.i18nResolved;
   const asked = Array.isArray(requestedKey) ? requestedKey[0] : requestedKey;
   if (typeof asked !== 'string' || asked === '') return null;
@@ -112,7 +109,13 @@ export function keyOf(
       namespace = key.slice(0, at);
       key = key.slice(at + nsSeparator.length);
     }
-  } else if (typeof options.count === 'number') {
+  } else if (
+    typeof options.count === 'number' &&
+    resolved?.exactUsedKey !== undefined &&
+    resolved.exactUsedKey !== resolved.usedKey
+  ) {
+    // i18next read a suffixed resource for a shorter key: the suffix is the
+    // plural form, not part of the name.
     key = key.replace(PLURAL_SUFFIX, '');
   }
 
@@ -125,7 +128,11 @@ export function keyOf(
     };
     namespace = first(requested) ?? first(fallback) ?? 'translation';
   }
-  return key === '' ? null : { namespace, key };
+  if (key === '') return null;
+  // A call that names its language (`t(key, { lng })`) shows that language,
+  // whatever the app's own language is.
+  const language = typeof options.lng === 'string' && options.lng !== '' ? options.lng : undefined;
+  return language ? { namespace, key, language } : { namespace, key };
 }
 
 function addPostProcess(instance: i18n): void {
@@ -165,7 +172,7 @@ export const LocalizeInContext: ThirdPartyModule = {
         if (typeof value !== 'string' || value === '') return value as string;
         const target = keyOf(key, translateOptions, instance);
         if (!target) return value;
-        return value + encodeMarker(registry.id(target.namespace, target.key));
+        return value + encodeMarker(registry.id(target.namespace, target.key, target.language));
       },
     });
     addPostProcess(instance);

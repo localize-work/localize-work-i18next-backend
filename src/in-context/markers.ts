@@ -22,6 +22,8 @@ const MARKER_SOURCE = `${FRAME}([${DIGITS[0]}-${DIGITS[3]}]+)${FRAME}`;
 export interface MarkedKey {
   namespace: string;
   key: string;
+  /** The language the call asked for with `lng`, when it named one. */
+  language?: string;
 }
 
 export function encodeMarker(id: number): string {
@@ -84,14 +86,14 @@ export class MarkerRegistry {
   private readonly ids = new Map<string, number>();
   private readonly keys: MarkedKey[] = [];
 
-  id(namespace: string, key: string): number {
-    // NUL cannot appear in a namespace or key name, so the pair is unambiguous.
-    const lookup = `${namespace}\u0000${key}`;
+  id(namespace: string, key: string, language?: string): number {
+    // NUL cannot appear in a namespace, key or language name, so the parts are unambiguous.
+    const lookup = `${namespace}\u0000${key}\u0000${language ?? ''}`;
     let id = this.ids.get(lookup);
     if (id === undefined) {
       id = this.keys.length;
       this.ids.set(lookup, id);
-      this.keys.push({ namespace, key });
+      this.keys.push(language ? { namespace, key, language } : { namespace, key });
     }
     return id;
   }

@@ -259,7 +259,10 @@ export function startOverlay(context: OverlayContext): OverlayHandle {
   }
 
   function openEditor(key: MarkedKey): void {
-    const locale = i18next.resolvedLanguage ?? i18next.language;
+    // The language the person chose, not the one a missing translation fell
+    // back to: opening fr-CA must not edit fr. The editor picks the nearest
+    // project language when it has no such one.
+    const locale = key.language ?? i18next.language;
     const request = { project: projectSlug, namespace: key.namespace, key: key.key, locale };
     if (editor && !editor.closed && editorReady) {
       // The editor is open: switch it to this key without reloading it.
