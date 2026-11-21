@@ -125,6 +125,8 @@ Things to know:
 - Text in an element's content and in `placeholder`, `title`, `aria-label` and
   `alt` attributes can be clicked. Text drawn another way (a canvas, the
   document title) cannot.
+- One project per page. If a page starts editing for a second i18next instance
+  that names another project, editing stays off for that instance.
 - With server rendering, turn editing on only in the browser; the server's
   HTML has no markers, so React reports a hydration mismatch in editing mode.
 - The editor opens in its own window because it signs people in with a cookie

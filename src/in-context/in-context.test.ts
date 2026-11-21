@@ -10,7 +10,14 @@ import {
   MarkerRegistry,
   stripMarkers,
 } from './markers.js';
-import { applySavedValues, findHit, MESSAGE_SOURCE, resourceKey, startOverlay } from './overlay.js';
+import {
+  appLanguage,
+  applySavedValues,
+  findHit,
+  MESSAGE_SOURCE,
+  resourceKey,
+  startOverlay,
+} from './overlay.js';
 import { exitInContext, keyOf, LocalizeInContext, SESSION_FLAG } from './plugin.js';
 
 const resources = {
@@ -202,6 +209,61 @@ test('a key that is not found is named in the namespace that was asked for', asy
     { namespace: 'billing', key: 'other.new' },
     { namespace: 'common', key: 'title' },
   ]);
+});
+
+test('a second instance shares marker numbers, and a second project stays off', async () => {
+  const first = await instance({ localizeInContext: { enabled: true } });
+  // Rendered before the second instance exists, and still on the page after.
+  const common = ids(first.t('title'));
+  const second = await instance({
+    localizeInContext: { enabled: true },
+    defaultNS: 'billing',
+  });
+  // That text still names its own key once the second instance has turned
+  // editing on: "common:title", not the second instance's "billing:title".
+  const billing = ids(second.t('title'));
+  assert.notDeepEqual(common, billing);
+  assert.deepEqual(ids(first.t('title')), common);
+  assert.deepEqual(ids(second.t('title', { ns: 'common' })), common);
+
+  const warnings: unknown[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => warnings.push(args[0]);
+  try {
+    const other = await instance({
+      backend: { projectSlug: 'another-project' },
+      localizeInContext: { enabled: true },
+    });
+    assert.equal(other.t('title'), 'Welcome');
+    assert.match(String(warnings[0]), /already on for project "shop".*one project per page/);
+    // The first project keeps working.
+    assert.deepEqual(ids(first.t('title')), common);
+  } finally {
+    console.warn = original;
+  }
+});
+
+test('saved text is stored under the spelling the app uses for the language', async () => {
+  const i18next = createInstance();
+  await i18next.init({
+    lng: 'fr-CA',
+    lowerCaseLng: true,
+    fallbackLng: 'en',
+    defaultNS: 'common',
+    resources: { 'fr-ca': { common: { title: 'Avant' } }, en: { common: { title: 'Welcome' } } },
+  });
+  assert.equal(i18next.language, 'fr-ca');
+  assert.equal(appLanguage(i18next, 'fr-CA'), 'fr-ca');
+  applySavedValues(i18next, 'common', 'title', [{ locale: 'fr-CA', pluralForm: '', value: 'Après' }]);
+  assert.equal(i18next.t('title'), 'Après');
+
+  // An app that writes fr_CA, named by the click that opened the editor.
+  assert.equal(appLanguage(i18next, 'fr-CA', 'fr_CA'), 'fr_CA');
+  // A language the app has not loaded is spelled as this i18next spells codes.
+  assert.equal(appLanguage(i18next, 'pt-BR'), 'pt-br');
+  const plain = await instance();
+  assert.equal(appLanguage(plain, 'et'), 'et');
+  assert.equal(appLanguage(plain, 'de-AT'), 'de-AT');
 });
 
 // ---------------------------------------------------------------- overlay

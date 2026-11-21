@@ -194,6 +194,18 @@ function addPostProcess(instance: i18n): void {
 let overlay: OverlayHandle | null = null;
 
 /**
+ * State for the whole page. i18next keeps post-processors by name for every
+ * instance at once, and markers stay in the page's text after the instance
+ * that wrote them is replaced. So there is one registry, whose numbers stay
+ * valid whichever instance wrote them, and one project: a marker carries no
+ * project, and the toolbar opens strings in a single one.
+ */
+const pageRegistry = new MarkerRegistry();
+let pageProject: string | null = null;
+/** The i18next instance behind each options object a translator hands over. */
+const instances = new WeakMap<object, i18n>();
+
+/**
  * i18next plugin for editing translations in place.
  *
  * ```ts
@@ -210,14 +222,32 @@ export const LocalizeInContext: ThirdPartyModule = {
   init(instance: i18n): void {
     const options = resolveOptions(instance);
     if (!options) return;
+    if (pageProject !== null && pageProject !== options.projectSlug) {
+      // A second project's strings would open under the first one's name.
+      console.warn(
+        `${PREFIX} editing is already on for project "${pageProject}"; ` +
+          `it stays off for "${options.projectSlug}" (one project per page)`,
+      );
+      return;
+    }
+    pageProject = options.projectSlug;
+    instances.set(instance.options, instance);
 
-    const registry = new MarkerRegistry();
+    const registry = pageRegistry;
     instance.use({
       type: 'postProcessor',
       name: POST_PROCESSOR_NAME,
-      process(value: unknown, key: string | string[], translateOptions: TOptions) {
+      process(
+        value: unknown,
+        key: string | string[],
+        translateOptions: TOptions,
+        translator?: { options?: object },
+      ) {
         if (typeof value !== 'string' || value === '') return value as string;
-        const target = keyOf(key, translateOptions, instance);
+        // The processor serves every instance that turned editing on; read
+        // the settings of the one that is translating.
+        const owner = (translator?.options && instances.get(translator.options)) || instance;
+        const target = keyOf(key, translateOptions, owner);
         if (!target) return value;
         return value + encodeMarker(registry.id(target.namespace, target.key, target.language));
       },

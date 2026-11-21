@@ -131,18 +131,55 @@ export function resourceKey(key: string, pluralForm: string): string {
   return pluralForm ? `${key}_${pluralForm}` : key;
 }
 
-/** Put saved text into i18next and ask bound views to render again. */
+const sameLanguage = (a: string, b: string) =>
+  a.replaceAll('_', '-').toLowerCase() === b.replaceAll('_', '-').toLowerCase();
+
+/**
+ * The app's own spelling of a language the editor names. The project writes
+ * `fr-CA`; an app may know the same language as `fr-ca` (i18next's
+ * `lowerCaseLng`) or `fr_CA`, and i18next looks text up under the app's
+ * spelling only.
+ */
+export function appLanguage(instance: i18n, locale: string, asked?: string): string {
+  const known = [
+    asked,
+    instance.language,
+    ...(instance.languages ?? []),
+    ...Object.keys((instance.store as { data?: Record<string, unknown> } | undefined)?.data ?? {}),
+  ];
+  const match = known.find(
+    (candidate): candidate is string => typeof candidate === 'string' && sameLanguage(candidate, locale),
+  );
+  if (match !== undefined) return match;
+  // A language the app has not loaded: spell it as this i18next would.
+  const utils = (instance.services as { languageUtils?: unknown } | undefined)?.languageUtils as
+    | { formatLanguageCode?: (code: string) => unknown }
+    | undefined;
+  const formatted = utils?.formatLanguageCode?.(locale);
+  return typeof formatted === 'string' && formatted !== '' ? formatted : locale;
+}
+
+/**
+ * Put saved text into i18next and ask bound views to render again. `asked`
+ * is the language the click opened, in the app's spelling.
+ */
 export function applySavedValues(
   instance: i18n,
   namespace: string,
   key: string,
   values: readonly SavedValue[],
+  asked?: string,
 ): void {
   let applied = false;
   for (const saved of values) {
     // Cleared text is not shown as empty: the published text stays visible.
     if (typeof saved.value !== 'string' || saved.value === '') continue;
-    instance.addResource(saved.locale, namespace, resourceKey(key, saved.pluralForm), saved.value);
+    instance.addResource(
+      appLanguage(instance, saved.locale, asked),
+      namespace,
+      resourceKey(key, saved.pluralForm),
+      saved.value,
+    );
     applied = true;
   }
   if (!applied) return;
@@ -193,6 +230,8 @@ export function startOverlay(context: OverlayContext): OverlayHandle {
   let editing = true;
   let editor: Window | null = null;
   let editorReady = false;
+  /** The language of the last click, as the app spells it. */
+  let lastAsked: string | undefined;
   let frame = 0;
 
   const host = document.createElement('div');
@@ -263,6 +302,7 @@ export function startOverlay(context: OverlayContext): OverlayHandle {
     // back to: opening fr-CA must not edit fr. The editor picks the nearest
     // project language when it has no such one.
     const locale = key.language ?? i18next.language;
+    lastAsked = locale;
     const request = { project: projectSlug, namespace: key.namespace, key: key.key, locale };
     if (editor && !editor.closed && editorReady) {
       // The editor is open: switch it to this key without reloading it.
@@ -307,7 +347,13 @@ export function startOverlay(context: OverlayContext): OverlayHandle {
     if (data.project !== projectSlug) return;
     if (typeof data.namespace !== 'string' || typeof data.key !== 'string') return;
     if (!Array.isArray(data.values)) return;
-    applySavedValues(i18next, data.namespace, data.key, data.values.filter(isSavedValue));
+    applySavedValues(
+      i18next,
+      data.namespace,
+      data.key,
+      data.values.filter(isSavedValue),
+      lastAsked,
+    );
   }
 
   function onScroll(): void {
