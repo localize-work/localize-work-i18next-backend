@@ -103,6 +103,12 @@ the address. From then on, in that browser tab:
 **Pause** in the toolbar lets you use the app normally for a moment; **Exit**
 (or `?localize=off`) turns editing off.
 
+An app on `localhost` works straight away. For any other address, an admin or
+developer of the project adds the site once under **Project settings →
+In-context editing** (for example `https://staging.your-app.example`). Until
+then the editor window opens and saves, but the page does not show the saved
+text.
+
 | Option (`localizeInContext`) | Default | Meaning |
 |---|---|---|
 | `enabled` | on with `?localize=edit` | `false` switches the feature off entirely, e.g. in production. `true` turns it on without the parameter; Exit and `?localize=off` still turn it off for the tab. |
