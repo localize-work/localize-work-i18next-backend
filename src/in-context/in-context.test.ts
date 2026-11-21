@@ -38,6 +38,35 @@ const resources = {
   et: { common: { title: 'Tere tulemast' } },
 };
 
+const GLOBALS = [
+  'window',
+  'document',
+  'Node',
+  'NodeFilter',
+  'Element',
+  'requestAnimationFrame',
+  'cancelAnimationFrame',
+] as const;
+
+/** Make a jsdom page the browser these tests run in; returns what was there before. */
+function useBrowser(dom: JSDOM): Map<string, unknown> {
+  const saved = new Map<string, unknown>();
+  for (const name of GLOBALS) {
+    saved.set(name, (globalThis as Record<string, unknown>)[name]);
+    (globalThis as Record<string, unknown>)[name] =
+      name === 'window' ? dom.window : (dom.window as unknown as Record<string, unknown>)[name];
+  }
+  return saved;
+}
+
+function restoreBrowser(saved: Map<string, unknown>): void {
+  for (const name of GLOBALS) (globalThis as Record<string, unknown>)[name] = saved.get(name);
+}
+
+// The plugin only works in a browser, so the tests run in one by default: a
+// plain page opened without the editing parameter.
+useBrowser(new JSDOM('<!doctype html><body></body>', { url: 'https://shop.example/' }));
+
 async function instance(options: Record<string, unknown> = {}): Promise<i18n> {
   const i18next = createInstance();
   await i18next.use(LocalizeInContext).init({
@@ -95,11 +124,28 @@ test('the registry gives each key one number', () => {
 
 // ----------------------------------------------------------------- plugin
 
-test('without a browser the plugin stays off unless it is forced on', async () => {
+test('the plugin stays off until it is asked for, and wherever it is refused', async () => {
   const off = await instance();
   assert.equal(off.t('title'), 'Welcome');
   const refused = await instance({ localizeInContext: { enabled: false } });
   assert.equal(refused.t('title'), 'Welcome');
+});
+
+test('on a server the plugin stays off even when it is forced on', async () => {
+  // Server rendering has no window: markers must not reach the HTML, emails
+  // or stored text, and per-request instances must not be kept.
+  const saved = new Map<string, unknown>();
+  for (const name of GLOBALS) {
+    saved.set(name, (globalThis as Record<string, unknown>)[name]);
+    delete (globalThis as Record<string, unknown>)[name];
+  }
+  try {
+    const server = await instance({ localizeInContext: { enabled: true } });
+    assert.equal(server.t('title'), 'Welcome');
+    assert.equal(server.options.postProcess, false);
+  } finally {
+    restoreBrowser(saved);
+  }
 });
 
 test('when on, every translated string carries a marker for the key it came from', async () => {
@@ -290,16 +336,6 @@ interface Page {
   exits: number;
   stop: () => void;
 }
-
-const GLOBALS = [
-  'window',
-  'document',
-  'Node',
-  'NodeFilter',
-  'Element',
-  'requestAnimationFrame',
-  'cancelAnimationFrame',
-] as const;
 
 /** A page with one marked heading and button, and the overlay running on it. */
 async function page(language = 'et'): Promise<Page> {
@@ -641,5 +677,35 @@ test('text saved in the editor shows in every i18next instance of the page', asy
     assert.equal(stripMarkers(widget.t('title')), 'Good morning');
   } finally {
     for (const name of GLOBALS) (globalThis as Record<string, unknown>)[name] = saved.get(name);
+  }
+});
+
+test('a click opens the language of the instance that drew the text', async () => {
+  const dom = new JSDOM('<!doctype html><body></body>', { url: 'https://shop.example/?localize=edit' });
+  const saved = useBrowser(dom);
+  const opened: string[] = [];
+  dom.window.open = ((url: string) => {
+    opened.push(url);
+    return null;
+  }) as never;
+  try {
+    // Two parts of one page in different languages; the English one starts last.
+    const estonian = await instance({ lng: 'et' });
+    const english = await instance({ lng: 'en' });
+    dom.window.document.body.innerHTML =
+      `<h1 id="et">${estonian.t('title')}</h1><h1 id="en">${english.t('title')}</h1>` +
+      `<p id="missing">${estonian.t('not.there', { defaultValue: 'Varutekst' })}</p>`;
+    const locale = (id: string) => {
+      dom.window.document
+        .getElementById(id)!
+        .dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+      return new URL(opened.at(-1)!).searchParams.get('locale');
+    };
+    assert.equal(locale('et'), 'et');
+    assert.equal(locale('en'), 'en');
+    // A text without a translation is still opened in its own instance's language.
+    assert.equal(locale('missing'), 'et');
+  } finally {
+    restoreBrowser(saved);
   }
 });

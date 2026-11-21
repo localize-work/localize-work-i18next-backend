@@ -63,6 +63,11 @@ function resolveOptions(instance: i18n): ResolvedInContextOptions | null {
     .localizeInContext;
   const options = raw ?? {};
   if (options.enabled === false) return null;
+  // Editing happens in a browser. On a server (server rendering, a script)
+  // the plugin stays off even with `enabled: true`: markers must not reach
+  // emails, API responses or stored text, and a server that creates an
+  // i18next instance per request must not have each one kept for the page.
+  if (typeof window === 'undefined' || typeof document === 'undefined') return null;
   const queryParameter = options.queryParameter ?? DEFAULT_QUERY_PARAMETER;
   const choice = visitorChoice(queryParameter);
   // `enabled: true` is on unless the visitor left; otherwise on when they asked.
@@ -252,12 +257,17 @@ export const LocalizeInContext: ThirdPartyModule = {
         const owner = (translator?.options && instances.get(translator.options)) || instance;
         const target = keyOf(key, translateOptions, owner);
         if (!target) return value;
-        return value + encodeMarker(registry.id(target.namespace, target.key, target.language));
+        // Without a language of its own, the call shows the language of the
+        // instance that drew it. Several instances on a page can differ, so
+        // the marker says which: a click then opens the language it shows.
+        const language =
+          target.language ??
+          (typeof owner.language === 'string' && owner.language !== '' ? owner.language : undefined);
+        return value + encodeMarker(registry.id(target.namespace, target.key, language));
       },
     });
     addPostProcess(instance);
 
-    if (typeof document === 'undefined') return;
     overlay?.stop();
     overlay = startOverlay({
       i18next: instance,

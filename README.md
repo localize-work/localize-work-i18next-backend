@@ -127,8 +127,9 @@ Things to know:
   document title) cannot.
 - One project per page. If a page starts editing for a second i18next instance
   that names another project, editing stays off for that instance.
-- With server rendering, turn editing on only in the browser; the server's
-  HTML has no markers, so React reports a hydration mismatch in editing mode.
+- The plugin works in the browser only; on a server it stays off, even with
+  `enabled: true`. With server rendering, the server's HTML therefore has no
+  markers, and React reports a hydration mismatch in editing mode.
 - The editor opens in its own window because it signs people in with a cookie
   that browsers do not send to an embedded frame on another site. Allow
   pop-ups for your app if the browser blocks it.
