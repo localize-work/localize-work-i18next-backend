@@ -33,6 +33,11 @@ export interface OverlayContext {
   editorUrl: string;
   /** Called when the person chooses Exit in the toolbar. */
   onExit: () => void;
+  /**
+   * Every i18next instance on the page that shows this project's text.
+   * Saved text goes to each of them; without it, to `i18next` alone.
+   */
+  instances?: () => Iterable<i18n>;
 }
 
 export interface OverlayHandle {
@@ -141,22 +146,28 @@ const sameLanguage = (a: string, b: string) =>
  * spelling only.
  */
 export function appLanguage(instance: i18n, locale: string, asked?: string): string {
+  const utils = (instance.services as { languageUtils?: unknown } | undefined)?.languageUtils as
+    | { formatLanguageCode?: (code: string) => unknown }
+    | undefined;
+  // i18next looks text up under its own formatting of a language code, also
+  // of one passed to a single call: with `lowerCaseLng`, `lng: 'fr-CA'` reads
+  // from `fr-ca`.
+  const format = (code: string | undefined): string | undefined => {
+    if (typeof code !== 'string' || code === '') return undefined;
+    const formatted = utils?.formatLanguageCode?.(code);
+    return typeof formatted === 'string' && formatted !== '' ? formatted : code;
+  };
   const known = [
-    asked,
-    instance.language,
+    format(asked),
+    format(instance.language),
     ...(instance.languages ?? []),
     ...Object.keys((instance.store as { data?: Record<string, unknown> } | undefined)?.data ?? {}),
   ];
   const match = known.find(
     (candidate): candidate is string => typeof candidate === 'string' && sameLanguage(candidate, locale),
   );
-  if (match !== undefined) return match;
   // A language the app has not loaded: spell it as this i18next would.
-  const utils = (instance.services as { languageUtils?: unknown } | undefined)?.languageUtils as
-    | { formatLanguageCode?: (code: string) => unknown }
-    | undefined;
-  const formatted = utils?.formatLanguageCode?.(locale);
-  return typeof formatted === 'string' && formatted !== '' ? formatted : locale;
+  return match ?? format(locale) ?? locale;
 }
 
 /**
@@ -347,13 +358,11 @@ export function startOverlay(context: OverlayContext): OverlayHandle {
     if (data.project !== projectSlug) return;
     if (typeof data.namespace !== 'string' || typeof data.key !== 'string') return;
     if (!Array.isArray(data.values)) return;
-    applySavedValues(
-      i18next,
-      data.namespace,
-      data.key,
-      data.values.filter(isSavedValue),
-      lastAsked,
-    );
+    const values = data.values.filter(isSavedValue);
+    // Any instance on the page may have drawn the text that was clicked.
+    for (const instance of context.instances?.() ?? [i18next]) {
+      applySavedValues(instance, data.namespace, data.key, values, lastAsked);
+    }
   }
 
   function onScroll(): void {

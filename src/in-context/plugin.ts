@@ -204,6 +204,8 @@ const pageRegistry = new MarkerRegistry();
 let pageProject: string | null = null;
 /** The i18next instance behind each options object a translator hands over. */
 const instances = new WeakMap<object, i18n>();
+/** Every instance that turned editing on; saved text is shown in each. */
+const pageInstances = new Set<i18n>();
 
 /**
  * i18next plugin for editing translations in place.
@@ -232,6 +234,7 @@ export const LocalizeInContext: ThirdPartyModule = {
     }
     pageProject = options.projectSlug;
     instances.set(instance.options, instance);
+    pageInstances.add(instance);
 
     const registry = pageRegistry;
     instance.use({
@@ -262,6 +265,7 @@ export const LocalizeInContext: ThirdPartyModule = {
       projectSlug: options.projectSlug,
       editorUrl: options.editorUrl,
       onExit: () => exitInContext(options.queryParameter),
+      instances: () => pageInstances,
     });
   },
 };

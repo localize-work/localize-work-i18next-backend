@@ -257,11 +257,23 @@ test('saved text is stored under the spelling the app uses for the language', as
   applySavedValues(i18next, 'common', 'title', [{ locale: 'fr-CA', pluralForm: '', value: 'Après' }]);
   assert.equal(i18next.t('title'), 'Après');
 
-  // An app that writes fr_CA, named by the click that opened the editor.
-  assert.equal(appLanguage(i18next, 'fr-CA', 'fr_CA'), 'fr_CA');
+  // A language passed to one call is formatted by i18next too: with
+  // lowerCaseLng, `lng: 'fr-CA'` reads from fr-ca, so that is where a save goes.
+  assert.equal(appLanguage(i18next, 'fr-CA', 'fr-CA'), 'fr-ca');
+  applySavedValues(
+    i18next,
+    'common',
+    'title',
+    [{ locale: 'fr-CA', pluralForm: '', value: 'Encore' }],
+    'fr-CA',
+  );
+  assert.equal(i18next.t('title', { lng: 'fr-CA' }), 'Encore');
   // A language the app has not loaded is spelled as this i18next spells codes.
   assert.equal(appLanguage(i18next, 'pt-BR'), 'pt-br');
+
   const plain = await instance();
+  // An app that writes fr_CA, named by the click that opened the editor.
+  assert.equal(appLanguage(plain, 'fr-CA', 'fr_CA'), 'fr_CA');
   assert.equal(appLanguage(plain, 'et'), 'et');
   assert.equal(appLanguage(plain, 'de-AT'), 'de-AT');
 });
@@ -594,6 +606,39 @@ test('opening the page with ?localize=edit turns editing on for the tab', async 
     assert.equal(hasMarker((await instance()).t('title')), true);
     dom.reconfigure({ url: 'https://shop.example/cart' });
     assert.equal(hasMarker((await instance()).t('title')), false);
+  } finally {
+    for (const name of GLOBALS) (globalThis as Record<string, unknown>)[name] = saved.get(name);
+  }
+});
+
+test('text saved in the editor shows in every i18next instance of the page', async () => {
+  const dom = new JSDOM('<!doctype html><body></body>', { url: 'https://shop.example/?localize=edit' });
+  const saved = new Map<string, unknown>();
+  for (const name of GLOBALS) {
+    saved.set(name, (globalThis as Record<string, unknown>)[name]);
+    (globalThis as Record<string, unknown>)[name] =
+      name === 'window' ? dom.window : (dom.window as unknown as Record<string, unknown>)[name];
+  }
+  try {
+    // Two parts of a page, each with its own i18next for the same project.
+    // Each has its own copy of the texts, as instances loaded from a backend do.
+    const header = await instance({ resources: structuredClone(resources) });
+    const widget = await instance({ resources: structuredClone(resources) });
+    dom.window.dispatchEvent(
+      new dom.window.MessageEvent('message', {
+        origin: 'https://app.localize.work',
+        data: {
+          source: MESSAGE_SOURCE,
+          type: 'translations',
+          project: 'shop',
+          namespace: 'common',
+          key: 'title',
+          values: [{ locale: 'en', pluralForm: '', value: 'Good morning' }],
+        },
+      }),
+    );
+    assert.equal(stripMarkers(header.t('title')), 'Good morning');
+    assert.equal(stripMarkers(widget.t('title')), 'Good morning');
   } finally {
     for (const name of GLOBALS) (globalThis as Record<string, unknown>)[name] = saved.get(name);
   }
