@@ -565,6 +565,38 @@ test('pausing lets the page work normally, and Exit hands control back', async (
   }
 });
 
+test('a link inside a translated sentence opens the sentence, not the link', async () => {
+  const state = await page();
+  try {
+    const document = state.dom.window.document;
+    const sentence = encodeMarker(state.registry.id('legal', 'agree'));
+    const note = encodeMarker(state.registry.id('legal', 'note'));
+    // What react-i18next's Trans renders: the marker ends the whole text.
+    document.body.insertAdjacentHTML(
+      'beforeend',
+      `<p id="agree">Read our <a id="terms" href="/terms">Terms</a> and ` +
+        `<strong><a id="privacy" href="/privacy">Privacy</a></strong>.${sentence}</p>` +
+        `<p>Note${note} <a id="after" href="/more">more</a></p>` +
+        `<p><a id="lone" href="/elsewhere">Elsewhere</a></p>`,
+    );
+    for (const id of ['terms', 'privacy']) {
+      const event = click(state, id);
+      assert.equal(event.defaultPrevented, true, id);
+      assert.equal(new URL(state.opened.pop()!).searchParams.get('key'), 'agree', id);
+    }
+    assert.equal(
+      findHit(document.getElementById('terms'), 0, 0, state.registry)?.element.id,
+      'agree',
+    );
+    // A link after the text's marker, or beside no translated text, is just a link.
+    assert.equal(click(state, 'after').defaultPrevented, false);
+    assert.equal(click(state, 'lone').defaultPrevented, false);
+    assert.equal(state.opened.length, 0);
+  } finally {
+    state.stop();
+  }
+});
+
 test('findHit prefers the key of the text under the pointer', async () => {
   const state = await page();
   try {

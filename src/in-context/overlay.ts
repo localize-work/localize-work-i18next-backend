@@ -125,6 +125,20 @@ export function findHit(
         const key = marker ? registry.key(marker.id) : null;
         if (key) return { key, element: node.parentElement ?? element };
       }
+      // A control with no text of its own may be part of a longer text, as a
+      // link inside a sentence is (react-i18next's Trans renders it so). The
+      // sentence's marker then follows the control, in the text beside it or
+      // beside an element that wraps it.
+      let inner: Element = element;
+      for (let up = level; up < MAX_ANCESTORS && inner.parentElement; up++) {
+        for (let sibling = inner.nextSibling; sibling; sibling = sibling.nextSibling) {
+          if (sibling.nodeType !== Node.TEXT_NODE) continue;
+          const marker = markerAt(sibling.nodeValue ?? '', 0);
+          const key = marker ? registry.key(marker.id) : null;
+          if (key) return { key, element: inner.parentElement };
+        }
+        inner = inner.parentElement;
+      }
       return null;
     }
   }
