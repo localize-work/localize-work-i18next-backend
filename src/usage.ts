@@ -89,6 +89,11 @@ interface TrackerConfig {
 interface StoreHook {
   /** Trackers fed by this store, with how many backends attached each. */
   trackers: Map<UsageTracker, number>;
+  /**
+   * Bumped whenever the store reports added or removed resources, so an
+   * object a lookup returned is walked again once its contents may differ.
+   */
+  generation: number;
 }
 
 type GetResource = (...args: unknown[]) => unknown;
@@ -204,7 +209,7 @@ export class UsageTracker {
    * When each object a lookup returned was last walked, per namespace and
    * lookup path: one object can sit under several keys.
    */
-  private walked = new WeakMap<object, Map<string, number>>();
+  private walked = new WeakMap<object, Map<string, { at: number; generation: number }>>();
   private warnedObjectCap = false;
   /** Resource stores this tracker is attached to, counted per backend. */
   attachments = 0;
@@ -313,13 +318,19 @@ export class UsageTracker {
    * skips cycles, so an object an app builds itself cannot stall a lookup;
    * leaves past those limits are not reported.
    */
-  recordObject(namespace: string, key: string, value: object): void {
+  recordObject(namespace: string, key: string, value: object, generation = 0): void {
     if (this.stopped) return;
     const now = Date.now();
     const walkKey = `${namespace}\u0000${key}`;
     let byPath = this.walked.get(value);
-    const walkedAt = byPath?.get(walkKey);
-    if (walkedAt !== undefined && now - walkedAt < USAGE_REPORT_AGAIN_MS) return;
+    const walked = byPath?.get(walkKey);
+    if (
+      walked !== undefined &&
+      walked.generation === generation &&
+      now - walked.at < USAGE_REPORT_AGAIN_MS
+    ) {
+      return;
+    }
     let entries = 0;
     let truncated = false;
     let accepted = true;
@@ -329,13 +340,22 @@ export class UsageTracker {
       if (onPath.has(node)) return;
       onPath.add(node);
       try {
-        for (const [child, entry] of Object.entries(node)) {
+        // for...in reads one property at a time, so the bound is checked
+        // before each read, not after every value of a wide object was read.
+        for (const child in node) {
+          if (!Object.prototype.hasOwnProperty.call(node, child)) continue;
           if (this.stopped) return;
           if (entries >= USAGE_MAX_OBJECT_ENTRIES) {
             truncated = true;
             return;
           }
           entries++;
+          let entry: unknown;
+          try {
+            entry = (node as Record<string, unknown>)[child];
+          } catch {
+            continue;
+          }
           const childPath = `${path}.${child}`;
           if (typeof entry === 'string') {
             if (!this.record(namespace, childPath)) accepted = false;
@@ -367,7 +387,7 @@ export class UsageTracker {
       byPath = new Map();
       this.walked.set(value, byPath);
     }
-    byPath.set(walkKey, now);
+    byPath.set(walkKey, { at: now, generation });
   }
 
   /**
@@ -864,11 +884,11 @@ function pageHost(): string | undefined {
 }
 
 /**
- * `key` with i18next's effective key separator replaced by '.': the lookup's
- * own `keySeparator` option, else the store's. A separator of false (or '.')
- * leaves the key as it is, as i18next then does not split it either.
+ * i18next's effective key separator for a lookup, when it is one other than
+ * '.': the lookup's own `keySeparator` option, else the store's. Undefined
+ * for '.' and for false, as the key then needs no translating.
  */
-function dottedKey(key: string, lookupOptions: unknown, store: unknown): string {
+function customSeparator(lookupOptions: unknown, store: unknown): string | undefined {
   let separator: unknown;
   if (lookupOptions !== null && typeof lookupOptions === 'object') {
     separator = (lookupOptions as { keySeparator?: unknown }).keySeparator;
@@ -879,8 +899,65 @@ function dottedKey(key: string, lookupOptions: unknown, store: unknown): string 
       separator = (storeOptions as { keySeparator?: unknown }).keySeparator;
     }
   }
-  if (typeof separator !== 'string' || separator === '' || separator === '.') return key;
-  return key.includes(separator) ? key.split(separator).join('.') : key;
+  if (typeof separator !== 'string' || separator === '' || separator === '.') return undefined;
+  return separator;
+}
+
+function hasOwn(object: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+/**
+ * The published dotted name of what a lookup with a custom key separator
+ * resolved, found the way i18next's resource store finds it: by splitting
+ * the key at the separator, else by joining split parts back together where
+ * a stored name itself contains the separator (i18next's deepFind). So
+ * `group_items_other` with separator '_' that resolved `items_other` under
+ * `group` is `group.items_other`, and `a/b/c` with '/' that resolved `c`
+ * under `a/b` is `a/b.c`. Undefined when nothing resolves.
+ */
+export function resolvedDottedKey(
+  data: unknown,
+  key: string,
+  separator: string,
+): string | undefined {
+  if (data === null || typeof data !== 'object') return undefined;
+  const tokens = key.split(separator);
+  let node: unknown = data;
+  let found = true;
+  for (const token of tokens) {
+    if (node !== null && typeof node === 'object' && hasOwn(node, token)) {
+      node = (node as Record<string, unknown>)[token];
+    } else {
+      found = false;
+      break;
+    }
+  }
+  if (found && node !== undefined) return tokens.join('.');
+  if (hasOwn(data, key) && (data as Record<string, unknown>)[key]) return key;
+  const segments: string[] = [];
+  let current: unknown = data;
+  for (let i = 0; i < tokens.length; ) {
+    if (current === null || typeof current !== 'object') return undefined;
+    let next: unknown;
+    let nextPath = '';
+    let j = i;
+    for (; j < tokens.length; j++) {
+      if (j !== i) nextPath += separator;
+      nextPath += tokens[j];
+      next = (current as Record<string, unknown>)[nextPath];
+      if (next !== undefined) {
+        const scalar = ['string', 'number', 'boolean'].includes(typeof next);
+        if (scalar && j < tokens.length - 1) continue;
+        break;
+      }
+    }
+    if (next === undefined || j >= tokens.length) return undefined;
+    segments.push(nextPath);
+    i = j + 1;
+    current = next;
+  }
+  return segments.join('.');
 }
 
 /**
@@ -896,7 +973,22 @@ function attachToStore(
   if (!hook) {
     const original = store.getResource;
     const attached = new Map<UsageTracker, number>();
-    hook = { trackers: attached };
+    hook = { trackers: attached, generation: 0 };
+    const storeHook = hook;
+    // An object a lookup returned is walked again once resources were added
+    // to or removed from the store, as its contents may have changed.
+    const on = (store as { on?: unknown }).on;
+    if (typeof on === 'function') {
+      const bump = () => {
+        storeHook.generation++;
+      };
+      try {
+        on.call(store, 'added', bump);
+        on.call(store, 'removed', bump);
+      } catch {
+        // Without events an object is walked again after the report interval.
+      }
+    }
     const getResource = function (this: unknown, ...args: unknown[]): unknown {
       const result = original.apply(this, args);
       try {
@@ -905,13 +997,26 @@ function attachToStore(
         if (typeof namespace === 'string' && namespace !== '' && typeof key === 'string' && key !== '') {
           // Published keys are dotted (`group.action`). A lookup with another
           // separator (`group/action` with keySeparator '/') is also recorded
-          // under its dotted name, which is the one the API stores.
-          const dotted = dottedKey(key, args[3], this);
+          // under its dotted name, and under the dotted name of what it
+          // resolved, which can keep the separator inside a stored name
+          // (`group.items_other` for `group_items_other` with '_').
+          const names = [key];
+          const separator = customSeparator(args[3], this);
+          if (separator !== undefined && key.includes(separator)) {
+            names.push(key.split(separator).join('.'));
+            const language = args[0];
+            if (typeof language === 'string' && !language.includes('.')) {
+              const data = (this as { data?: Record<string, Record<string, unknown>> }).data;
+              const resolved = resolvedDottedKey(data?.[language]?.[namespace], key, separator);
+              if (resolved !== undefined) names.push(resolved);
+            }
+          }
+          const unique = [...new Set(names)];
+          const objectPath = unique[unique.length - 1]!;
           for (const tracker of attached.keys()) {
-            tracker.record(namespace, key);
-            if (dotted !== key) tracker.record(namespace, dotted);
+            for (const name of unique) tracker.record(namespace, name);
             if (result !== null && typeof result === 'object') {
-              tracker.recordObject(namespace, dotted, result);
+              tracker.recordObject(namespace, objectPath, result, storeHook.generation);
             }
           }
         }

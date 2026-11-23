@@ -8,6 +8,7 @@ import { LocalizeBackend } from './backend.js';
 import type { LocalizeBackendOptions, TrackUsageOptions } from './options.js';
 import {
   resetUsageTracking,
+  resolvedDottedKey,
   USAGE_REQUEST_TIMEOUT_MS,
   UsageTracker,
   utf8Length,
@@ -1365,4 +1366,84 @@ test('a namespace that cannot be put in a URL drops only its own batch', async (
   await settle();
   await retiring;
   assert.ok(warnings.some((args) => String(args[0]).includes('namespace cannot be sent')));
+});
+
+test('a custom-separator lookup is also recorded under the dotted name of what it resolved', async (t) => {
+  const calls = mockFetch();
+  const instance = await makeI18n();
+  useFakeTimers(t);
+  const data = storeOf(instance).data.et!.common!;
+  data.group = { items_one: 'üks', items_other: 'palju' };
+  data['x/y'] = { z: 'Z' };
+  assert.equal(instance.t('group_items', { keySeparator: '_', count: 2 }), 'palju');
+  assert.equal(instance.t('x/y/z', { keySeparator: '/' }), 'Z');
+  await advance(t, 30_000);
+  const names = calls.flatMap((call) => call.names);
+  assert.ok(names.includes('group.items_other'), 'the plural form as published');
+  assert.ok(names.includes('x/y.z'), 'a stored name that holds the separator');
+});
+
+test('resolved dotted names follow how i18next finds a key', () => {
+  const data = { group: { items_other: 'x' }, 'a/b': { c: 'C' }, plain: { key: 'k' }, 'whole/key': 'w' };
+  assert.equal(resolvedDottedKey(data, 'plain/key', '/'), 'plain.key');
+  assert.equal(resolvedDottedKey(data, 'group_items_other', '_'), 'group.items_other');
+  assert.equal(resolvedDottedKey(data, 'a/b/c', '/'), 'a/b.c');
+  assert.equal(resolvedDottedKey(data, 'whole/key', '/'), 'whole/key');
+  assert.equal(resolvedDottedKey(data, 'missing/key', '/'), undefined);
+  assert.equal(resolvedDottedKey(undefined, 'a/b', '/'), undefined);
+});
+
+test('an object is walked again once resources were added to the store', async (t) => {
+  const calls = mockFetch();
+  const instance = await makeI18n();
+  useFakeTimers(t);
+  storeOf(instance).data.et!.common!.nav = { home: 'Kodu' };
+  instance.t('nav', { returnObjects: true, keySeparator: false });
+  instance.addResource('et', 'common', 'nav.fresh', 'Uus');
+  instance.t('nav', { returnObjects: true, keySeparator: false });
+  await advance(t, 30_000);
+  assert.deepEqual(calls.flatMap((call) => call.names).sort(), ['nav', 'nav.fresh', 'nav.home']);
+});
+
+test('a clone keeps reporting after its parent re-initializes with the same settings', async (t) => {
+  const calls = mockFetch();
+  const instance = await makeI18n();
+  const clone = instance.cloneInstance();
+  await instance.init({
+    lng: 'et',
+    fallbackLng: 'en',
+    ns: ['common', 'admin'],
+    defaultNS: 'common',
+    backend: { ...devOptions, trackUsage: true },
+  });
+  await settle();
+  useFakeTimers(t);
+  assert.equal(clone.t('a.b'), 'A ja B');
+  await advance(t, 30_000);
+  assert.ok(calls.flatMap((call) => call.names).includes('a.b'));
+});
+
+test('a wide object is read only up to the walk bound', (t) => {
+  silenceWarnings(t);
+  mockFetch();
+  const tracker = new UsageTracker({
+    apiBaseUrl: API,
+    apiKey: 'pk_test_123',
+    projectSlug: 'doc-in-pocket',
+    flushIntervalMs: 1_000,
+  });
+  t.after(() => tracker.stop());
+  let reads = 0;
+  const wide: Record<string, unknown> = {};
+  for (let i = 0; i < 50_000; i++) {
+    Object.defineProperty(wide, `k${i}`, {
+      enumerable: true,
+      get() {
+        reads++;
+        return 'x';
+      },
+    });
+  }
+  tracker.recordObject('common', 'wide', wide);
+  assert.ok(reads <= 10_000, `read ${reads} properties`);
 });

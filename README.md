@@ -252,10 +252,13 @@ How it works:
   with `keySeparator: false`, where i18next does not look them up itself. At
   most 10,000 entries and 32 levels of such an object are read (cycles are
   skipped), with one warning when an object is bigger: look up its parts to
-  record the rest.
+  record the rest. An object is read again after resources are added to or
+  removed from the store, so text added to it later is recorded too.
 - A lookup with another key separator (`t('group/action', { keySeparator: '/' })`)
-  is recorded under the name you used and under its dotted name
-  (`group.action`), which is how the key is stored.
+  is recorded under the name you used, under its dotted name
+  (`group.action`), and under the dotted name of the text it found, which can
+  keep the separator inside a stored name (`t('group_items', { keySeparator: '_', count: 2 })`
+  finds `items_other` under `group` and records `group.items_other`).
 - Keys are sent per namespace, at most 1,000 per request, every
   `flushIntervalMs` and when the page is hidden or closed. A request still
   unanswered after 30 seconds is abandoned and retried like a network error. In a browser, each
@@ -283,6 +286,9 @@ How it works:
 - An instance made with `i18next.cloneInstance()` shares its parent's resource
   store and is tracked; one made with `cloneInstance({ forkResourceStore: true })`
   gets a new store the backend never sees, so its lookups are not reported.
+  When the parent calls `init()` again with the same tracking settings, its
+  clones stay reported until they are garbage collected; with other settings
+  (a new key or project) the old settings stop at once, clones included.
   For server rendering, clone without `forkResourceStore`, or create and
   `init()` an instance per request: once such an instance is garbage
   collected, a tracker only it used sends what it queued (waiting out a rate

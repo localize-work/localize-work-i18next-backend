@@ -80,7 +80,35 @@ class LatestResolutionError extends Error {
  * the resource store and (for a registered class) the backend are new each
  * time.
  */
-const usageByInstance = new WeakMap<object, () => void>();
+const usageByInstance = new WeakMap<object, UsageAttachment>();
+
+interface UsageAttachment {
+  detach: () => void;
+  /** The resource store this attachment hooked. */
+  store: unknown;
+  /** Identifies the tracker: the settings it reports with. */
+  trackerKey: string;
+}
+
+/**
+ * Detaches a store that an instance's init() replaced, once the store is
+ * collected. A clone (`cloneInstance()` without forkResourceStore) keeps
+ * reading the store it was made with, so with unchanged settings that store
+ * stays tracked as long as something can still look keys up in it.
+ */
+const replacedStoreCleanup =
+  typeof FinalizationRegistry === 'function'
+    ? new FinalizationRegistry<() => void>((detach) => detach())
+    : undefined;
+
+function trackerKeyOf(options: ResolvedOptions): string {
+  return [
+    options.apiBaseUrl ?? '',
+    options.projectSlug,
+    options.apiKey ?? '',
+    options.trackUsage ? String(options.trackUsage.flushIntervalMs) : '',
+  ].join('\u0000');
+}
 
 /**
  * Detaches the usage tracking of an i18next instance that was discarded
@@ -149,14 +177,31 @@ export class LocalizeBackend implements BackendModule<LocalizeBackendOptions> {
     const detach = this.options.trackUsage
       ? startUsageTracking(store, this.options)
       : undefined;
+    const trackerKey = trackerKeyOf(this.options);
     if (instanceKey) {
       usageCleanup?.unregister(instanceKey);
       if (detach) {
-        usageByInstance.set(instanceKey, detach);
+        usageByInstance.set(instanceKey, { detach, store, trackerKey });
         usageCleanup?.register(instanceKey, detach, instanceKey);
       } else usageByInstance.delete(instanceKey);
     }
-    previous?.();
+    if (!previous) return;
+    // The store init() replaced may still serve clones of this instance.
+    // With unchanged settings it stays tracked until it is collected; new
+    // settings (a rotated key, another project) retire the old ones now.
+    const replacedStore = previous.store;
+    if (
+      detach &&
+      previous.trackerKey === trackerKey &&
+      replacedStore !== store &&
+      typeof replacedStore === 'object' &&
+      replacedStore !== null &&
+      replacedStoreCleanup
+    ) {
+      replacedStoreCleanup.register(replacedStore, previous.detach);
+    } else {
+      previous.detach();
+    }
   }
 
   read(language: string, namespace: string, callback: ReadCallback): void {
