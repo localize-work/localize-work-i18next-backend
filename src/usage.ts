@@ -55,8 +55,12 @@ export const USAGE_REQUEST_TIMEOUT_MS = 30_000;
 const EXIT_MAX_WAITS = 2;
 const EXIT_MAX_WAIT_MS = 65_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
-/** String leaves reported at most per object a lookup returns. */
-const USAGE_MAX_OBJECT_LEAVES = 10_000;
+/**
+ * Entries (texts, objects and arrays) visited at most per object a lookup
+ * returns, so an object an app builds itself, with shared or cyclic parts,
+ * cannot stall a translation lookup.
+ */
+export const USAGE_MAX_OBJECT_ENTRIES = 10_000;
 /** Nesting followed at most below an object a lookup returns. */
 const USAGE_MAX_OBJECT_DEPTH = 32;
 
@@ -196,8 +200,12 @@ export class UsageTracker {
   private inFlight = new Set<Promise<void>>();
   /** The timer flush running now, if any. */
   private timerFlush: Promise<void> | undefined;
-  /** When each object a lookup returned was last walked for its leaves. */
-  private walked = new WeakMap<object, number>();
+  /**
+   * When each object a lookup returned was last walked, per namespace and
+   * lookup path: one object can sit under several keys.
+   */
+  private walked = new WeakMap<object, Map<string, number>>();
+  private warnedObjectCap = false;
   /** Resource stores this tracker is attached to, counted per backend. */
   attachments = 0;
 
@@ -210,12 +218,16 @@ export class UsageTracker {
     return !this.stopped;
   }
 
-  record(namespace: string, key: string): void {
-    if (this.stopped) return;
+  /**
+   * Record one looked-up name. Returns false when a full queue or the memory
+   * cap turned it away, so a later lookup must record it again.
+   */
+  record(namespace: string, key: string): boolean {
+    if (this.stopped) return false;
     const now = Date.now();
     let names = this.seen.get(namespace);
     const recordedAt = names?.get(key);
-    if (recordedAt !== undefined && now - recordedAt < USAGE_REPORT_AGAIN_MS) return;
+    if (recordedAt !== undefined && now - recordedAt < USAGE_REPORT_AGAIN_MS) return true;
     if (recordedAt === undefined && this.seenCount >= USAGE_MAX_TRACKED_NAMES) {
       this.sweep(now);
       // The sweep may have dropped this namespace's map.
@@ -228,7 +240,7 @@ export class UsageTracker {
           `${PREFIX} trackUsage recorded ${USAGE_MAX_TRACKED_NAMES} keys on this page and ignores any further ones`,
         );
       }
-      return;
+      return false;
     }
     // Marks the name as reported for USAGE_REPORT_AGAIN_MS. Done only once it
     // is queued, already waiting, or never sendable: a name turned away by a
@@ -242,7 +254,10 @@ export class UsageTracker {
       if (recordedAt === undefined) this.seenCount++;
     };
     // No key name contains NUL (the API stores names as PostgreSQL text).
-    if (key.includes('\u0000')) return markSeen();
+    if (key.includes('\u0000')) {
+      markSeen();
+      return true;
+    }
     // A UTF-16 code unit is at most 3 bytes: count only names that could be long.
     if (key.length * 3 > USAGE_MAX_NAME_BYTES && utf8Length(key) > USAGE_MAX_NAME_BYTES) {
       markSeen();
@@ -253,11 +268,14 @@ export class UsageTracker {
             `(first one in namespace "${namespace}")`,
         );
       }
-      return;
+      return true;
     }
     let unsentNames = this.unsent.get(namespace);
     // Still waiting from its last report: that report carries it.
-    if (unsentNames?.has(key)) return markSeen();
+    if (unsentNames?.has(key)) {
+      markSeen();
+      return true;
+    }
     if (this.unsentCount >= USAGE_MAX_TRACKED_NAMES) {
       if (!this.warnedUnsentCap) {
         this.warnedUnsentCap = true;
@@ -265,7 +283,7 @@ export class UsageTracker {
           `${PREFIX} trackUsage has ${USAGE_MAX_TRACKED_NAMES} keys waiting to be sent and ignores further ones until they are`,
         );
       }
-      return;
+      return false;
     }
     markSeen();
     if (!unsentNames) {
@@ -281,34 +299,75 @@ export class UsageTracker {
     }
     queue.push(key);
     this.schedule();
+    return true;
   }
 
   /**
    * A lookup returned an object, as `t(key, { returnObjects: true })` does.
    * i18next looks up each child itself unless keySeparator is false, so its
    * string leaves are recorded here too, under their published dotted names.
-   * Each object is walked at most once per report interval.
+   * `key` is the lookup's dotted path. Each (namespace, path) of an object is
+   * walked at most once per report interval, and counts as walked only when
+   * no leaf was turned away by a full queue. A walk visits at most
+   * USAGE_MAX_OBJECT_ENTRIES entries and USAGE_MAX_OBJECT_DEPTH levels and
+   * skips cycles, so an object an app builds itself cannot stall a lookup;
+   * leaves past those limits are not reported.
    */
   recordObject(namespace: string, key: string, value: object): void {
     if (this.stopped) return;
     const now = Date.now();
-    const walkedAt = this.walked.get(value);
+    const walkKey = `${namespace}\u0000${key}`;
+    let byPath = this.walked.get(value);
+    const walkedAt = byPath?.get(walkKey);
     if (walkedAt !== undefined && now - walkedAt < USAGE_REPORT_AGAIN_MS) return;
-    this.walked.set(value, now);
-    let leaves = 0;
+    let entries = 0;
+    let truncated = false;
+    let accepted = true;
+    // Objects on the path to the current node: a cycle stops there.
+    const onPath = new Set<object>();
     const walk = (node: object, path: string, depth: number): void => {
-      for (const [child, entry] of Object.entries(node)) {
-        if (leaves >= USAGE_MAX_OBJECT_LEAVES || this.stopped) return;
-        const childPath = `${path}.${child}`;
-        if (typeof entry === 'string') {
-          leaves++;
-          this.record(namespace, childPath);
-        } else if (entry !== null && typeof entry === 'object' && depth < USAGE_MAX_OBJECT_DEPTH) {
-          walk(entry as object, childPath, depth + 1);
+      if (onPath.has(node)) return;
+      onPath.add(node);
+      try {
+        for (const [child, entry] of Object.entries(node)) {
+          if (this.stopped) return;
+          if (entries >= USAGE_MAX_OBJECT_ENTRIES) {
+            truncated = true;
+            return;
+          }
+          entries++;
+          const childPath = `${path}.${child}`;
+          if (typeof entry === 'string') {
+            if (!this.record(namespace, childPath)) accepted = false;
+          } else if (entry !== null && typeof entry === 'object') {
+            if (depth >= USAGE_MAX_OBJECT_DEPTH) {
+              truncated = true;
+              continue;
+            }
+            walk(entry as object, childPath, depth + 1);
+          }
         }
+      } finally {
+        onPath.delete(node);
       }
     };
     walk(value, key, 1);
+    if (truncated && !this.warnedObjectCap) {
+      this.warnedObjectCap = true;
+      console.warn(
+        `${PREFIX} trackUsage reports at most ${USAGE_MAX_OBJECT_ENTRIES} entries and ` +
+          `${USAGE_MAX_OBJECT_DEPTH} levels of an object a lookup returns ` +
+          `("${key}" in namespace "${namespace}"): look up its parts to record the rest`,
+      );
+    }
+    // A leaf turned away by a full queue is recorded on the next lookup. A
+    // truncated walk still counts: walking again reaches the same leaves.
+    if (!accepted || this.stopped) return;
+    if (!byPath) {
+      byPath = new Map();
+      this.walked.set(value, byPath);
+    }
+    byPath.set(walkKey, now);
   }
 
   /**
@@ -442,10 +501,12 @@ export class UsageTracker {
           // a 429 or a failure and put its batch back: wait for it first.
           await this.settleInFlight();
           await this.send('exit');
-          await this.settleInFlight();
         } catch (error) {
           console.warn(`${PREFIX} trackUsage failed sending keys:`, error);
         }
+        // Also after a failure above: a request still out may put its batch
+        // back, and stopping before it settles would drop it unseen.
+        await this.settleInFlight();
         if (this.stopped || !this.hasWork()) break;
         const wait = Math.max(this.blockedUntil - Date.now(), USAGE_RATE_LIMIT_MIN_MS);
         if (waits >= EXIT_MAX_WAITS || wait > EXIT_MAX_WAIT_MS) {
@@ -528,7 +589,7 @@ export class UsageTracker {
       const batches = this.batches.splice(0);
       let keepaliveBudget =
         mode === 'pagehide' ? KEEPALIVE_BUDGET_BYTES - keepaliveInFlight : 0;
-      await Promise.all(
+      await Promise.allSettled(
         batches.map((batch) => {
           const keepalive = batch.bytes <= keepaliveBudget;
           if (keepalive) keepaliveBudget -= batch.bytes;
@@ -563,7 +624,19 @@ export class UsageTracker {
   }
 
   private async postOnce(batch: Batch, round: number, keepalive: boolean): Promise<void> {
-    const url = usedUrl(this.config.apiBaseUrl, this.config.projectSlug, batch.namespace);
+    let url: string;
+    try {
+      url = usedUrl(this.config.apiBaseUrl, this.config.projectSlug, batch.namespace);
+    } catch (error) {
+      // A namespace that cannot be put in a URL (an unpaired UTF-16
+      // surrogate) can never be sent: drop that batch alone.
+      this.settle(batch);
+      console.warn(
+        `${PREFIX} trackUsage dropped ${batch.names.length} key(s): their namespace cannot be sent:`,
+        error,
+      );
+      return;
+    }
     let response: Response;
     if (keepalive) keepaliveInFlight += batch.bytes;
     try {
@@ -791,6 +864,26 @@ function pageHost(): string | undefined {
 }
 
 /**
+ * `key` with i18next's effective key separator replaced by '.': the lookup's
+ * own `keySeparator` option, else the store's. A separator of false (or '.')
+ * leaves the key as it is, as i18next then does not split it either.
+ */
+function dottedKey(key: string, lookupOptions: unknown, store: unknown): string {
+  let separator: unknown;
+  if (lookupOptions !== null && typeof lookupOptions === 'object') {
+    separator = (lookupOptions as { keySeparator?: unknown }).keySeparator;
+  }
+  if (separator === undefined && store !== null && typeof store === 'object') {
+    const storeOptions = (store as { options?: unknown }).options;
+    if (storeOptions !== null && typeof storeOptions === 'object') {
+      separator = (storeOptions as { keySeparator?: unknown }).keySeparator;
+    }
+  }
+  if (typeof separator !== 'string' || separator === '' || separator === '.') return key;
+  return key.includes(separator) ? key.split(separator).join('.') : key;
+}
+
+/**
  * Wrap a resource store's getResource once, however many backends attach to
  * it. Returns a function that detaches `tracker` again.
  */
@@ -810,10 +903,15 @@ function attachToStore(
         const namespace = args[1];
         const key = args[2];
         if (typeof namespace === 'string' && namespace !== '' && typeof key === 'string' && key !== '') {
+          // Published keys are dotted (`group.action`). A lookup with another
+          // separator (`group/action` with keySeparator '/') is also recorded
+          // under its dotted name, which is the one the API stores.
+          const dotted = dottedKey(key, args[3], this);
           for (const tracker of attached.keys()) {
             tracker.record(namespace, key);
+            if (dotted !== key) tracker.record(namespace, dotted);
             if (result !== null && typeof result === 'object') {
-              tracker.recordObject(namespace, key, result);
+              tracker.recordObject(namespace, dotted, result);
             }
           }
         }

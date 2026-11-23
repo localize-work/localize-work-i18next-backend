@@ -249,7 +249,13 @@ How it works:
   plural suffix) are skipped with one warning.
 - A lookup that returns an object (`t('nav', { returnObjects: true })`) also
   records the object's text keys under their dotted names (`nav.home`), even
-  with `keySeparator: false`, where i18next does not look them up itself.
+  with `keySeparator: false`, where i18next does not look them up itself. At
+  most 10,000 entries and 32 levels of such an object are read (cycles are
+  skipped), with one warning when an object is bigger: look up its parts to
+  record the rest.
+- A lookup with another key separator (`t('group/action', { keySeparator: '/' })`)
+  is recorded under the name you used and under its dotted name
+  (`group.action`), which is how the key is stored.
 - Keys are sent per namespace, at most 1,000 per request, every
   `flushIntervalMs` and when the page is hidden or closed. A request still
   unanswered after 30 seconds is abandoned and retried like a network error. In a browser, each

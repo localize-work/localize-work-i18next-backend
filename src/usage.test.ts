@@ -1254,3 +1254,115 @@ test('an object a lookup returns has its string leaves recorded under dotted nam
     [['a', 'a.b']],
   );
 });
+
+test('an object with shared or cyclic parts is walked within a bound', (t) => {
+  const warnings = silenceWarnings(t);
+  mockFetch();
+  const tracker = new UsageTracker({
+    apiBaseUrl: API,
+    apiKey: 'pk_test_123',
+    projectSlug: 'doc-in-pocket',
+    flushIntervalMs: 1_000,
+  });
+  t.after(() => tracker.stop());
+  // 21 levels, each pointing twice at the next: 2^21 paths, no text.
+  let node: Record<string, unknown> = {};
+  for (let i = 0; i < 21; i++) node = { left: node, right: node };
+  const cyclic: Record<string, unknown> = { text: 'Hi' };
+  cyclic.self = cyclic;
+  const recorded: string[] = [];
+  const record = tracker.record.bind(tracker);
+  t.mock.method(tracker, 'record', (namespace: string, key: string) => {
+    recorded.push(key);
+    return record(namespace, key);
+  });
+  const started = performance.now();
+  tracker.recordObject('common', 'big', node);
+  assert.ok(performance.now() - started < 500, 'the walk stops at its entry bound');
+  tracker.recordObject('common', 'loop', cyclic);
+  assert.ok(recorded.includes('loop.text'), 'the cycle is entered once');
+  assert.ok(!recorded.some((key) => key.includes('.self.')), 'and not followed round');
+  assert.equal(warnings.length, 1, 'one warning names the bound');
+});
+
+test('one object under two keys has its leaves recorded under both', async (t) => {
+  const calls = mockFetch();
+  const instance = await makeI18n();
+  useFakeTimers(t);
+  const shared = { home: 'Kodu' };
+  const data = storeOf(instance).data.et!.common!;
+  data.nav = shared;
+  data.menu = shared;
+  instance.t('nav', { returnObjects: true, keySeparator: false });
+  instance.t('menu', { returnObjects: true, keySeparator: false });
+  await advance(t, 30_000);
+  assert.deepEqual(
+    calls.flatMap((call) => call.names).sort(),
+    ['menu', 'menu.home', 'nav', 'nav.home'],
+  );
+});
+
+test('leaves of an object turned away by a full queue are recorded on the next lookup', (t) => {
+  silenceWarnings(t);
+  mockFetch();
+  const tracker = new UsageTracker({
+    apiBaseUrl: API,
+    apiKey: 'pk_test_123',
+    projectSlug: 'doc-in-pocket',
+    flushIntervalMs: 1_000,
+  });
+  t.after(() => tracker.stop());
+  let full = true;
+  const record = tracker.record.bind(tracker);
+  const accepted: string[] = [];
+  t.mock.method(tracker, 'record', (namespace: string, key: string) => {
+    if (full) return false;
+    accepted.push(key);
+    return record(namespace, key);
+  });
+  const value = { home: 'Kodu' };
+  tracker.recordObject('common', 'nav', value);
+  full = false;
+  tracker.recordObject('common', 'nav', value);
+  assert.deepEqual(accepted, ['nav.home'], 'the second lookup walks it again');
+  tracker.recordObject('common', 'nav', value);
+  assert.deepEqual(accepted, ['nav.home'], 'once taken, it is not walked again soon');
+});
+
+test('a lookup with another key separator is also recorded under its dotted name', async (t) => {
+  const calls = mockFetch();
+  const instance = await makeI18n();
+  useFakeTimers(t);
+  assert.equal(instance.t('a/b', { keySeparator: '/' }), 'A ja B');
+  await advance(t, 30_000);
+  assert.deepEqual(calls.flatMap((call) => call.names).sort(), ['a.b', 'a/b']);
+});
+
+test('a namespace that cannot be put in a URL drops only its own batch', async (t) => {
+  const warnings = silenceWarnings(t);
+  const pending: ((response: Response) => void)[] = [];
+  const calls = mockFetch(
+    () => new Promise<Response>((resolve) => pending.push(resolve)) as unknown as Response,
+  );
+  const tracker = new UsageTracker({
+    apiBaseUrl: API,
+    apiKey: 'pk_test_123',
+    projectSlug: 'doc-in-pocket',
+    flushIntervalMs: 1_000,
+  });
+  useFakeTimers(t);
+  tracker.record('common', 'a.b');
+  tracker.record('bad\uD800', 'x');
+  tracker.attachments = 0;
+  const retiring = tracker.retire();
+  await settle();
+  assert.equal(calls.length, 1, 'the valid batch is sent');
+  pending.shift()!(json({ error: 'rate_limited' }, 429, { 'Retry-After': '1' }));
+  await settle();
+  await advance(t, 1_000);
+  assert.equal(calls.length, 2, 'its rate limit is waited out, not lost');
+  pending.shift()!(ok());
+  await settle();
+  await retiring;
+  assert.ok(warnings.some((args) => String(args[0]).includes('namespace cannot be sent')));
+});
