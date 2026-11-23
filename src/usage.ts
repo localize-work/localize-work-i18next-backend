@@ -55,6 +55,10 @@ export const USAGE_REQUEST_TIMEOUT_MS = 30_000;
 const EXIT_MAX_WAITS = 2;
 const EXIT_MAX_WAIT_MS = 65_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+/** String leaves reported at most per object a lookup returns. */
+const USAGE_MAX_OBJECT_LEAVES = 10_000;
+/** Nesting followed at most below an object a lookup returns. */
+const USAGE_MAX_OBJECT_DEPTH = 32;
 
 const STORE_HOOK = Symbol.for('@localize-work/i18next-backend/usage');
 
@@ -188,6 +192,12 @@ export class UsageTracker {
   private removeExitListeners: (() => void) | undefined;
   /** Ends a retire() wait early when the tracker is stopped. */
   private retireWake: (() => void) | undefined;
+  /** Requests started and not yet settled, whichever flush started them. */
+  private inFlight = new Set<Promise<void>>();
+  /** The timer flush running now, if any. */
+  private timerFlush: Promise<void> | undefined;
+  /** When each object a lookup returned was last walked for its leaves. */
+  private walked = new WeakMap<object, number>();
   /** Resource stores this tracker is attached to, counted per backend. */
   attachments = 0;
 
@@ -274,6 +284,34 @@ export class UsageTracker {
   }
 
   /**
+   * A lookup returned an object, as `t(key, { returnObjects: true })` does.
+   * i18next looks up each child itself unless keySeparator is false, so its
+   * string leaves are recorded here too, under their published dotted names.
+   * Each object is walked at most once per report interval.
+   */
+  recordObject(namespace: string, key: string, value: object): void {
+    if (this.stopped) return;
+    const now = Date.now();
+    const walkedAt = this.walked.get(value);
+    if (walkedAt !== undefined && now - walkedAt < USAGE_REPORT_AGAIN_MS) return;
+    this.walked.set(value, now);
+    let leaves = 0;
+    const walk = (node: object, path: string, depth: number): void => {
+      for (const [child, entry] of Object.entries(node)) {
+        if (leaves >= USAGE_MAX_OBJECT_LEAVES || this.stopped) return;
+        const childPath = `${path}.${child}`;
+        if (typeof entry === 'string') {
+          leaves++;
+          this.record(namespace, childPath);
+        } else if (entry !== null && typeof entry === 'object' && depth < USAGE_MAX_OBJECT_DEPTH) {
+          walk(entry as object, childPath, depth + 1);
+        }
+      }
+    };
+    walk(value, key, 1);
+  }
+
+  /**
    * Forget names whose report is old enough to be sent again, at most once a
    * minute, so the memory cap does not end tracking for good.
    */
@@ -295,12 +333,17 @@ export class UsageTracker {
   async flush(mode: FlushMode = 'timer'): Promise<void> {
     if (mode === 'timer') this.flushing = true;
     try {
-      await this.send(mode);
+      const sending = this.send(mode);
+      if (mode === 'timer') this.timerFlush = sending;
+      await sending;
     } catch (error) {
       // A bug here must not surface in the app; report it and carry on.
       console.warn(`${PREFIX} trackUsage failed sending keys:`, error);
     } finally {
-      if (mode === 'timer') this.flushing = false;
+      if (mode === 'timer') {
+        this.flushing = false;
+        this.timerFlush = undefined;
+      }
       if (mode === 'exit') this.waitBeforeExit();
       this.schedule();
     }
@@ -312,7 +355,10 @@ export class UsageTracker {
    * Retry-After wait, a bounded number of times, then say what was dropped.
    */
   private waitBeforeExit(): void {
-    if (this.stopped || this.exitTimer !== undefined || !this.hasWork()) return;
+    // retire() runs its own bounded wait.
+    if (this.stopped || retiring.has(this) || this.exitTimer !== undefined || !this.hasWork()) {
+      return;
+    }
     const wait = this.blockedUntil - Date.now();
     // Not held back: a retry is due now, and beforeExit fires again for it.
     if (wait <= 0) return;
@@ -381,6 +427,9 @@ export class UsageTracker {
     if (this.stopped) return;
     if (this.timer !== undefined) clearTimeout(this.timer);
     this.timer = undefined;
+    // A pending exit-flush wait would run beside this loop: this loop waits.
+    if (this.exitTimer !== undefined) clearTimeout(this.exitTimer);
+    this.exitTimer = undefined;
     // Listeners go now, not when the send settles: a process re-initializing
     // backends quickly would otherwise pile them up meanwhile.
     this.removeExitListeners?.();
@@ -389,7 +438,11 @@ export class UsageTracker {
     try {
       for (let waits = 0; ; waits++) {
         try {
+          // A request a timer flush already started may still come back with
+          // a 429 or a failure and put its batch back: wait for it first.
+          await this.settleInFlight();
           await this.send('exit');
+          await this.settleInFlight();
         } catch (error) {
           console.warn(`${PREFIX} trackUsage failed sending keys:`, error);
         }
@@ -423,10 +476,23 @@ export class UsageTracker {
     return this.pending.size > 0 || this.batches.length > 0;
   }
 
+  /**
+   * Wait until no request is in flight and no timer flush runs: a running
+   * timer flush starts its next request when the last one settles.
+   */
+  private async settleInFlight(): Promise<void> {
+    while (this.inFlight.size > 0 || this.timerFlush !== undefined) {
+      await Promise.allSettled([...this.inFlight, ...(this.timerFlush ? [this.timerFlush] : [])]);
+    }
+  }
+
   private schedule(): void {
     // While a timer flush runs, the next one is scheduled when it settles, so
     // timer requests never overlap.
-    if (this.stopped || this.flushing || this.timer !== undefined || !this.hasWork()) return;
+    // A retiring tracker sends from retire() alone.
+    if (this.stopped || retiring.has(this) || this.flushing || this.timer !== undefined || !this.hasWork()) {
+      return;
+    }
     const delay = Math.min(
       Math.max(this.config.flushIntervalMs, this.blockedUntil - Date.now()),
       MAX_TIMER_DELAY_MS,
@@ -488,7 +554,15 @@ export class UsageTracker {
     }
   }
 
-  private async post(batch: Batch, round: number, keepalive: boolean): Promise<void> {
+  private post(batch: Batch, round: number, keepalive: boolean): Promise<void> {
+    const request = this.postOnce(batch, round, keepalive);
+    this.inFlight.add(request);
+    // postOnce never rejects; the catch only keeps a bug from going unhandled.
+    void request.catch(() => undefined).finally(() => this.inFlight.delete(request));
+    return request;
+  }
+
+  private async postOnce(batch: Batch, round: number, keepalive: boolean): Promise<void> {
     const url = usedUrl(this.config.apiBaseUrl, this.config.projectSlug, batch.namespace);
     let response: Response;
     if (keepalive) keepaliveInFlight += batch.bytes;
@@ -736,7 +810,12 @@ function attachToStore(
         const namespace = args[1];
         const key = args[2];
         if (typeof namespace === 'string' && namespace !== '' && typeof key === 'string' && key !== '') {
-          for (const tracker of attached.keys()) tracker.record(namespace, key);
+          for (const tracker of attached.keys()) {
+            tracker.record(namespace, key);
+            if (result !== null && typeof result === 'object') {
+              tracker.recordObject(namespace, key, result);
+            }
+          }
         }
       } catch {
         // Tracking must never break a translation lookup.

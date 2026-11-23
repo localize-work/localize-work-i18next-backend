@@ -247,6 +247,9 @@ How it works:
   server or tab), unless its last report is still waiting to go out. Names
   over 2,062 bytes of UTF-8 (longer than any key the API stores, plus a
   plural suffix) are skipped with one warning.
+- A lookup that returns an object (`t('nav', { returnObjects: true })`) also
+  records the object's text keys under their dotted names (`nav.home`), even
+  with `keySeparator: false`, where i18next does not look them up itself.
 - Keys are sent per namespace, at most 1,000 per request, every
   `flushIntervalMs` and when the page is hidden or closed. A request still
   unanswered after 30 seconds is abandoned and retried like a network error. In a browser, each

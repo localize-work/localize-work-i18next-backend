@@ -1213,3 +1213,44 @@ test('a key turned away by a full queue is recorded on its next lookup', async (
   // Keep the instance alive to here: once collected, its tracker retires.
   assert.ok(instance.isInitialized);
 });
+
+test('a retired tracker retries a request that was in flight when it retired', async (t) => {
+  const pending: ((response: Response) => void)[] = [];
+  const calls = mockFetch(
+    () => new Promise<Response>((resolve) => pending.push(resolve)) as unknown as Response,
+  );
+  silenceWarnings(t);
+  const instance = await makeI18n({ flushIntervalMs: 1_000 });
+  const backend = instance.services.backendConnector.backend as LocalizeBackend;
+  useFakeTimers(t);
+  instance.t('a.b');
+  await advance(t, 1_000);
+  assert.equal(calls.length, 1, 'the timer request is in flight');
+  // Tracking off retires the tracker while its request is open.
+  backend.init(instance.services, { ...devOptions, trackUsage: false }, {} as InitOptions);
+  await settle();
+  pending.shift()!(json({ error: 'rate_limited' }, 429, { 'Retry-After': '1' }));
+  await settle();
+  await advance(t, 1_000);
+  assert.deepEqual(
+    calls.map((call) => call.names),
+    [['a.b'], ['a.b']],
+    'the rate-limited batch is sent again once the wait is over',
+  );
+  pending.shift()!(ok());
+  await settle();
+});
+
+test('an object a lookup returns has its string leaves recorded under dotted names', async (t) => {
+  const calls = mockFetch();
+  const instance = await makeI18n();
+  useFakeTimers(t);
+  // keySeparator: false returns the object without looking up its children.
+  const value = instance.t('a', { returnObjects: true, keySeparator: false }) as unknown;
+  assert.deepEqual(value, { b: 'A ja B' });
+  await advance(t, 30_000);
+  assert.deepEqual(
+    calls.map((call) => [...call.names].sort()),
+    [['a', 'a.b']],
+  );
+});
