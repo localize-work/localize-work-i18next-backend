@@ -243,7 +243,8 @@ How it works:
 - Every `t()` lookup is recorded with the key exactly as i18next looks it up —
   `items_other` for a plural, `nav.home` for a nested key — and the server
   maps it to the key in your project. Each key is sent at most once per page
-  load.
+  load, and again if it is still looked up six hours later (a long-running
+  server or tab).
 - Keys are sent per namespace, at most 1,000 per request, every
   `flushIntervalMs` and when the page is hidden or closed (with `keepalive`,
   so they are not lost when the tab closes):
@@ -258,8 +259,11 @@ How it works:
 
 - Tracking never throws into your app and never changes what `t()` returns.
   If the API rejects the key (401/403), it warns once and stops for the page.
-  Rate limits wait for `Retry-After`; server and network errors are retried on
-  the next flush, up to three attempts.
+  Rate limits wait for `Retry-After` (60 seconds when it is not readable);
+  server and network errors are retried on the next flush, up to three
+  attempts. Outside a browser, keys still queued are sent before the process
+  exits; if the API rate-limits them, the process waits for `Retry-After` up
+  to twice (at most 65 seconds each), then drops them with a warning.
 - Setting `trackUsage` without both `apiBaseUrl` and `apiKey` is an init error.
 
 More in the docs: https://localize.work/docs/sdk/usage-tracking/

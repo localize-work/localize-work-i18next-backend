@@ -9,16 +9,21 @@
  * Keys are recorded by wrapping i18next's `resourceStore.getResource`, which
  * every `t()` lookup goes through, and are sent exactly as i18next asks for
  * them (`items_one`, `nav.home`). Each (namespace, key) is sent at most once
- * per page load. Like saveMissing, nothing here ever throws into the app.
+ * per page load, and again after USAGE_REPORT_AGAIN_MS if it is still looked
+ * up (a long-running server or tab). Like saveMissing, nothing here ever
+ * throws into the app.
  */
 import type { ResolvedOptions } from './options.js';
 import { retryDelayMs } from './retry.js';
 import { usedUrl } from './url.js';
 
 const PREFIX = '[@localize-work/i18next-backend]';
-/** Server contract: 1–1000 names per request, each 1–512 characters. */
+/**
+ * Server contract: 1–1000 names per request, each 1–526 characters: the
+ * longest key name (512) plus the longest plural suffix (`_ordinal_other`).
+ */
 export const USAGE_MAX_NAMES_PER_REQUEST = 1_000;
-export const USAGE_MAX_NAME_LENGTH = 512;
+export const USAGE_MAX_NAME_LENGTH = 512 + '_ordinal_other'.length;
 /** Fastify's default body limit. */
 const USAGE_MAX_BODY_BYTES = 1024 * 1024;
 /** Browsers refuse keepalive requests once their bodies together pass 64 KiB. */
@@ -26,6 +31,17 @@ const KEEPALIVE_BUDGET_BYTES = 60 * 1024;
 export const USAGE_MAX_ATTEMPTS = 3;
 /** Memory cap: names remembered per page before new ones are ignored. */
 export const USAGE_MAX_TRACKED_NAMES = 50_000;
+/**
+ * A name looked up again this long after it was reported is reported again,
+ * so a server or tab that runs for weeks keeps its keys' last use current.
+ * The API refreshes a key's timestamp at most hourly anyway.
+ */
+export const USAGE_REPORT_AGAIN_MS = 6 * 60 * 60 * 1000;
+/** Wait after a 429 whose Retry-After the response did not expose. */
+const USAGE_RATE_LIMIT_FALLBACK_MS = 60_000;
+/** Before a Node process exits: how many rate-limit waits, and the longest one. */
+const EXIT_MAX_WAITS = 2;
+const EXIT_MAX_WAIT_MS = 65_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 const STORE_HOOK = Symbol.for('@localize-work/i18next-backend/usage');
@@ -62,9 +78,12 @@ interface HookableStore {
   [STORE_HOOK]?: StoreHook;
 }
 
-const encoder = new TextEncoder();
+// Created on first use: importing the backend must work in a runtime
+// without TextEncoder when tracking is off.
+let encoder: TextEncoder | undefined;
 
 function jsonBytes(value: string): number {
+  encoder ??= new TextEncoder();
   return encoder.encode(JSON.stringify(value)).byteLength;
 }
 
@@ -100,9 +119,11 @@ function unref(timer: unknown): void {
  * (outside a browser) before the process exits.
  */
 export class UsageTracker {
-  /** Every name recorded this page, per namespace — the dedup set. */
-  private seen = new Map<string, Set<string>>();
+  /** When each name was last recorded, per namespace — the dedup map. */
+  private seen = new Map<string, Map<string, number>>();
   private seenCount = 0;
+  /** Last sweep of expired names when the memory cap was reached. */
+  private lastSweep = 0;
   /** Names recorded since the last flush, per namespace. */
   private pending = new Map<string, string[]>();
   /** Chunks ready to send, including ones waiting for a retry. */
@@ -112,6 +133,11 @@ export class UsageTracker {
   /** No flush before this time (epoch ms) — set from a 429's Retry-After. */
   private blockedUntil = 0;
   private round = 0;
+  /** A timer flush is running; the next one is scheduled when it settles. */
+  private flushing = false;
+  private exitWaits = 0;
+  private exitTimer: ReturnType<typeof setTimeout> | undefined;
+  private warnedExitWait = false;
   private warnedCap = false;
   private warnedLongName = false;
   private removeExitListeners: (() => void) | undefined;
@@ -127,9 +153,12 @@ export class UsageTracker {
 
   record(namespace: string, key: string): void {
     if (this.stopped) return;
+    const now = Date.now();
     let names = this.seen.get(namespace);
-    if (names?.has(key)) return;
-    if (this.seenCount >= USAGE_MAX_TRACKED_NAMES) {
+    const recordedAt = names?.get(key);
+    if (recordedAt !== undefined && now - recordedAt < USAGE_REPORT_AGAIN_MS) return;
+    if (recordedAt === undefined && this.seenCount >= USAGE_MAX_TRACKED_NAMES) this.sweep(now);
+    if (recordedAt === undefined && this.seenCount >= USAGE_MAX_TRACKED_NAMES) {
       if (!this.warnedCap) {
         this.warnedCap = true;
         console.warn(
@@ -139,11 +168,11 @@ export class UsageTracker {
       return;
     }
     if (!names) {
-      names = new Set();
+      names = new Map();
       this.seen.set(namespace, names);
     }
-    names.add(key);
-    this.seenCount++;
+    names.set(key, now);
+    if (recordedAt === undefined) this.seenCount++;
     if (key.length > USAGE_MAX_NAME_LENGTH) {
       if (!this.warnedLongName) {
         this.warnedLongName = true;
@@ -163,16 +192,72 @@ export class UsageTracker {
     this.schedule();
   }
 
+  /**
+   * Forget names whose report is old enough to be sent again, at most once a
+   * minute, so the memory cap does not end tracking for good.
+   */
+  private sweep(now: number): void {
+    if (now - this.lastSweep < 60_000) return;
+    this.lastSweep = now;
+    for (const [namespace, names] of this.seen) {
+      for (const [name, recordedAt] of names) {
+        if (now - recordedAt >= USAGE_REPORT_AGAIN_MS) {
+          names.delete(name);
+          this.seenCount--;
+        }
+      }
+      if (names.size === 0) this.seen.delete(namespace);
+    }
+  }
+
   /** Send what is queued. Never rejects. */
   async flush(mode: FlushMode = 'timer'): Promise<void> {
+    if (mode === 'timer') this.flushing = true;
     try {
       await this.send(mode);
     } catch (error) {
       // A bug here must not surface in the app; report it and carry on.
       console.warn(`${PREFIX} trackUsage failed sending keys:`, error);
     } finally {
+      if (mode === 'timer') this.flushing = false;
+      if (mode === 'exit') this.waitBeforeExit();
       this.schedule();
     }
+  }
+
+  /**
+   * Before a Node process exits, keys held back by a 429 would be lost: the
+   * flush timer does not keep the process alive. Keep it alive for the
+   * Retry-After wait, a bounded number of times, then say what was dropped.
+   */
+  private waitBeforeExit(): void {
+    if (this.stopped || this.exitTimer !== undefined || !this.hasWork()) return;
+    const wait = this.blockedUntil - Date.now();
+    // Not held back: a retry is due now, and beforeExit fires again for it.
+    if (wait <= 0) return;
+    const queued =
+      this.batches.reduce((sum, batch) => sum + batch.names.length, 0) +
+      [...this.pending.values()].reduce((sum, names) => sum + names.length, 0);
+    if (this.exitWaits >= EXIT_MAX_WAITS || wait > EXIT_MAX_WAIT_MS) {
+      console.warn(
+        `${PREFIX} trackUsage dropped ${queued} key(s) unsent as the process exits: the API rate-limited them`,
+      );
+      this.pending.clear();
+      this.batches = [];
+      return;
+    }
+    this.exitWaits++;
+    if (!this.warnedExitWait) {
+      this.warnedExitWait = true;
+      console.warn(
+        `${PREFIX} trackUsage is rate limited: waiting ${Math.ceil(wait / 1000)} s to send ${queued} key(s) before the process exits`,
+      );
+    }
+    // Not unref'd: this timer is what keeps the process alive for the wait.
+    this.exitTimer = setTimeout(() => {
+      this.exitTimer = undefined;
+      void this.flush('exit');
+    }, wait);
   }
 
   /** Stop for good: drop queued keys, timers and listeners. */
@@ -180,7 +265,10 @@ export class UsageTracker {
     this.stopped = true;
     if (this.timer !== undefined) clearTimeout(this.timer);
     this.timer = undefined;
+    if (this.exitTimer !== undefined) clearTimeout(this.exitTimer);
+    this.exitTimer = undefined;
     this.seen.clear();
+    this.seenCount = 0;
     this.pending.clear();
     this.batches = [];
     this.removeExitListeners?.();
@@ -192,7 +280,9 @@ export class UsageTracker {
   }
 
   private schedule(): void {
-    if (this.stopped || this.timer !== undefined || !this.hasWork()) return;
+    // While a timer flush runs, the next one is scheduled when it settles, so
+    // timer requests never overlap.
+    if (this.stopped || this.flushing || this.timer !== undefined || !this.hasWork()) return;
     const delay = Math.min(
       Math.max(this.config.flushIntervalMs, this.blockedUntil - Date.now()),
       MAX_TIMER_DELAY_MS,
@@ -275,7 +365,12 @@ export class UsageTracker {
       return;
     }
     if (status === 429) {
-      this.blockedUntil = Math.max(this.blockedUntil, Date.now() + retryDelayMs(response, 0));
+      // Without a readable Retry-After (an older API, or a browser hiding it)
+      // wait out the API's whole rate-limit window.
+      const wait = response.headers.get('retry-after')
+        ? retryDelayMs(response, 0)
+        : USAGE_RATE_LIMIT_FALLBACK_MS;
+      this.blockedUntil = Math.max(this.blockedUntil, Date.now() + wait);
       this.batches.unshift(batch);
       return;
     }

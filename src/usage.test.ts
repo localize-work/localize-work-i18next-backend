@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import path from 'node:path';
 import test, { afterEach, type TestContext } from 'node:test';
 import i18next, { type i18n, type InitOptions, type Services } from 'i18next';
 import { JSDOM } from 'jsdom';
@@ -228,20 +230,131 @@ test('more than 1000 keys in a namespace are split into requests of 1000', async
   assert.equal(new Set(calls.flatMap((call) => call.names)).size, 2_001);
 });
 
-test('keys longer than 512 characters are skipped with one warning', async (t) => {
+test('names longer than a maximal plural lookup (526 characters) are skipped with one warning', async (t) => {
   const calls = mockFetch();
   const warnings = silenceWarnings(t);
   const instance = await makeI18n();
   useFakeTimers(t);
-  instance.t('x'.repeat(513));
+  instance.t('x'.repeat(527));
   instance.t('y'.repeat(600));
-  instance.t('z'.repeat(512));
+  // A 512-character plural key is looked up as `<key>_ordinal_other` at most.
+  instance.t(`${'z'.repeat(512)}_ordinal_other`);
   await advance(t, 30_000);
   assert.deepEqual(
     calls.map((call) => call.names),
-    [['z'.repeat(512)]],
+    [[`${'z'.repeat(512)}_ordinal_other`]],
   );
   assert.equal(warnings.length, 1);
+});
+
+test('a key still looked up six hours after its report is reported again', async (t) => {
+  const calls = mockFetch();
+  const instance = await makeI18n();
+  useFakeTimers(t);
+  instance.t('a.b');
+  await advance(t, 30_000);
+  for (let hour = 1; hour < 6; hour++) {
+    await advance(t, 60 * 60 * 1000);
+    instance.t('a.b');
+  }
+  await advance(t, 60 * 60 * 1000);
+  assert.equal(calls.length, 1, 'not within six hours');
+  instance.t('a.b');
+  await advance(t, 30_000);
+  assert.deepEqual(
+    calls.map((call) => call.names),
+    [['a.b'], ['a.b']],
+  );
+});
+
+test('timer flushes never overlap: the next waits for a slow request', async (t) => {
+  const pending: ((response: Response) => void)[] = [];
+  const calls = mockFetch(
+    () => new Promise<Response>((resolve) => pending.push(resolve)) as unknown as Response,
+  );
+  const instance = await makeI18n({ flushIntervalMs: 1_000 });
+  useFakeTimers(t);
+  instance.t('a.b');
+  await advance(t, 1_000);
+  assert.equal(calls.length, 1);
+  instance.t('onlyEn');
+  await advance(t, 5_000);
+  assert.equal(calls.length, 1, 'no second request while the first is open');
+  pending.shift()!(ok());
+  await settle();
+  await advance(t, 1_000);
+  assert.deepEqual(
+    calls.map((call) => call.names),
+    [['a.b'], ['onlyEn']],
+  );
+  pending.shift()!(ok());
+  await settle();
+});
+
+test('a 429 without a readable Retry-After waits out the 60 s window', async (t) => {
+  let rateLimited = true;
+  const calls = mockFetch(() => (rateLimited ? json({ error: 'rate_limited' }, 429) : ok()));
+  const instance = await makeI18n({ flushIntervalMs: 1_000 });
+  useFakeTimers(t);
+  instance.t('a.b');
+  await advance(t, 1_000);
+  rateLimited = false;
+  await advance(t, 59_000);
+  assert.equal(calls.length, 1);
+  await advance(t, 1_000);
+  assert.equal(calls.length, 2);
+});
+
+test('before a Node process exits, rate-limited keys wait for Retry-After, within a bound', async (t) => {
+  let answer = 0;
+  const calls = mockFetch(() => {
+    answer++;
+    return answer === 2 ? json({ error: 'rate_limited' }, 429, { 'Retry-After': '5' }) : ok();
+  });
+  const warnings = silenceWarnings(t);
+  const instance = await makeI18n();
+  useFakeTimers(t);
+  instance.t('a.b');
+  instance.t('admin:title');
+  process.emit('beforeExit', 0);
+  await settle();
+  assert.equal(calls.length, 2);
+  assert.equal(warnings.length, 1, 'says it is waiting');
+  await advance(t, 5_000);
+  assert.deepEqual(
+    calls.map((call) => call.url.split('/').pop()),
+    ['common', 'admin', 'admin'],
+  );
+});
+
+test('before a Node process exits, keys rate-limited for too long are dropped with a warning', async (t) => {
+  const calls = mockFetch(() => json({ error: 'rate_limited' }, 429, { 'Retry-After': '600' }));
+  const warnings = silenceWarnings(t);
+  const instance = await makeI18n();
+  useFakeTimers(t);
+  instance.t('a.b');
+  process.emit('beforeExit', 0);
+  await settle();
+  assert.equal(calls.length, 1);
+  assert.match(String(warnings[0]?.[0]), /dropped 1 key\(s\) unsent/);
+  process.emit('beforeExit', 0);
+  await advance(t, 700_000);
+  assert.equal(calls.length, 1);
+});
+
+test('importing the backend needs no TextEncoder while tracking is off', () => {
+  const result = spawnSync(
+    process.execPath,
+    [
+      '--import',
+      'tsx',
+      '--input-type=module',
+      '--eval',
+      "delete globalThis.TextEncoder; const m = await import('./src/index.ts'); if (typeof m.LocalizeBackend !== 'function') process.exit(2);",
+    ],
+    { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' },
+  );
+  assert.equal(result.status, 0, result.stderr);
 });
 
 test('stops recording new keys after 50,000 with one warning', async (t) => {
