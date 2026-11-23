@@ -50,7 +50,15 @@ interface UsageCall {
 const realFetch = globalThis.fetch;
 const savedGlobals = new Map<string, unknown>();
 
+/**
+ * Every instance a test makes stays referenced until the test ends: a test
+ * that holds only its store would otherwise let a garbage collection mid-test
+ * collect the instance and retire its tracker.
+ */
+const liveInstances: i18n[] = [];
+
 afterEach(() => {
+  liveInstances.length = 0;
   resetUsageTracking();
   globalThis.fetch = realFetch;
   for (const [name, value] of savedGlobals) {
@@ -96,6 +104,7 @@ async function makeI18n(trackUsage: boolean | TrackUsageOptions = true): Promise
     defaultNS: 'common',
     backend: { ...devOptions, trackUsage },
   });
+  liveInstances.push(instance);
   return instance;
 }
 
@@ -825,6 +834,7 @@ test('one backend object serving two i18next instances reports both', async (t) 
       defaultNS: 'common',
       backend: { ...devOptions, trackUsage: true },
     });
+    liveInstances.push(instance);
     return instance;
   };
   const first = await make();
@@ -854,6 +864,7 @@ test('trackers of two projects on one page share the keepalive budget', async ()
     defaultNS: 'common',
     backend: { ...devOptions, projectSlug: 'other-project', trackUsage: true },
   });
+  liveInstances.push(other);
   // About 45 KB of JSON per project: the second no longer fits the 60 KiB.
   for (let i = 0; i < 1_000; i++) {
     storeOf(one).getResource('et', 'common', `${'k'.repeat(40)}${i}`);
@@ -1211,8 +1222,6 @@ test('a key turned away by a full queue is recorded on its next lookup', async (
     await settle();
   }
   assert.equal(delivered(), 1, 'its next lookup queues it');
-  // Keep the instance alive to here: once collected, its tracker retires.
-  assert.ok(instance.isInitialized);
 });
 
 test('a retired tracker retries a request that was in flight when it retired', async (t) => {
