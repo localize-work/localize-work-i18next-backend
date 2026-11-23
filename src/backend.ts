@@ -1,7 +1,9 @@
 import type { BackendModule, InitOptions, ReadCallback, Services } from 'i18next';
 import type { LocalizeBackendOptions, ResolvedOptions } from './options.js';
 import { validateOptions } from './options.js';
+import { retryDelayMs } from './retry.js';
 import { cdnUrl, latestManifestUrl, missingUrl } from './url.js';
+import { startUsageTracking } from './usage.js';
 
 const PREFIX = '[@localize-work/i18next-backend]';
 const SAVE_MISSING_MAX_ENTRIES = 1_000;
@@ -56,17 +58,6 @@ function chunkMissingBody(body: Record<string, string>): MissingChunkResult {
   return { chunks, skipped };
 }
 
-function retryDelayMs(response: Response | undefined, attempt: number): number {
-  const retryAfter = response?.headers.get('retry-after');
-  if (retryAfter) {
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
-    const date = Date.parse(retryAfter);
-    if (!Number.isNaN(date)) return Math.max(date - Date.now(), 0);
-  }
-  return 250 * 2 ** attempt;
-}
-
 function wait(delayMs: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
@@ -100,6 +91,9 @@ class LatestResolutionError extends Error {
  * and POSTs them to the API. Active only when apiBaseUrl+apiKey are set;
  * failures are warned about, never thrown — saveMissing must never break the
  * host app.
+ *
+ * init() with `trackUsage`: hooks i18next's resource store so every key the
+ * app looks up is reported to the API in the background (see usage.ts).
  */
 export class LocalizeBackend implements BackendModule<LocalizeBackendOptions> {
   static type = 'backend' as const;
@@ -111,6 +105,8 @@ export class LocalizeBackend implements BackendModule<LocalizeBackendOptions> {
   private flushScheduled = false;
   /** One initialized backend uses one release across every locale/namespace read. */
   private latestVersion: Promise<string> | undefined;
+  /** Unhooks this backend's usage tracking from the store it was attached to. */
+  private detachUsage: (() => void) | undefined;
 
   constructor(services?: Services, options?: LocalizeBackendOptions, i18nextOptions?: InitOptions) {
     // i18next constructs plugin classes with no arguments and calls init()
@@ -120,9 +116,14 @@ export class LocalizeBackend implements BackendModule<LocalizeBackendOptions> {
     }
   }
 
-  init(_services: Services, backendOptions: LocalizeBackendOptions, _i18nextOptions: InitOptions): void {
+  init(services: Services, backendOptions: LocalizeBackendOptions, _i18nextOptions: InitOptions): void {
     this.options = validateOptions(backendOptions);
     this.latestVersion = undefined;
+    // A second init() replaces the first one's settings, usage tracking included.
+    this.detachUsage?.();
+    this.detachUsage = this.options.trackUsage
+      ? startUsageTracking(services?.resourceStore, this.options)
+      : undefined;
   }
 
   read(language: string, namespace: string, callback: ReadCallback): void {

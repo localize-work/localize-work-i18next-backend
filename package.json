@@ -1,7 +1,7 @@
 {
   "name": "@localize-work/i18next-backend",
-  "version": "0.10.0",
-  "description": "i18next backend plugin for localize.work — loads published translation JSON from the CDN, posts missing keys back to the API in development, and lets translators edit strings in the running app",
+  "version": "0.11.0",
+  "description": "i18next backend plugin for localize.work — loads published translation JSON from the CDN, posts missing keys back to the API in development, reports which keys the app uses, and lets translators edit strings in the running app",
   "keywords": [
     "i18next",
     "backend",

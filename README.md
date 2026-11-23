@@ -69,6 +69,7 @@ standard.
 | `fetchOptions` | `RequestInit` | — | Merged into every CDN request (custom headers, `cache`, credentials…). |
 | `loadPath` | `string \| (lng, ns) => string` | — | Escape hatch replacing the whole CDN URL. String form supports `{{lng}}` and `{{ns}}` placeholders. |
 | `onFailedLoad` | `(info: FailedLoadInfo) => void` | — | Observability hook; fires on every failed CDN load **including sparse 404s** (`info.status === 404`). Never changes load behavior. |
+| `trackUsage` | `boolean \| { allowedHosts?, flushIntervalMs? }` | off | Report which keys the app looks up, so the editor can show unused keys. Dev/staging only; needs `apiBaseUrl` and `apiKey` — see "Key usage tracking". |
 
 ## In-context editing
 
@@ -210,6 +211,58 @@ Notes:
 - The key is the *public* project API key. It can read and report missing keys,
   nothing else — but still avoid shipping saveMissing enabled to production, or
   end users' render paths will generate writes.
+
+## Key usage tracking (development and staging only)
+
+The backend can report which keys your app actually looks up, so the
+localize.work editor can show when each key was last used and point out keys
+nothing uses any more. Turn it on where people click through the whole app —
+your dev server, a staging site — not in production:
+
+```ts
+await i18next.use(LocalizeBackend).init({
+  // ...
+  backend: {
+    projectSlug: 'your-project',
+    cdnBaseUrl: 'https://cdn.localize.work',
+    apiBaseUrl: 'https://api.localize.work',
+    apiKey: import.meta.env.VITE_LOCALIZE_PUBLIC_KEY, // the same public key as saveMissing
+    trackUsage: true,
+    // or: trackUsage: { allowedHosts: ['localhost', 'staging.your-app.example'] },
+  },
+});
+```
+
+| `trackUsage` setting | Default | Meaning |
+|---|---|---|
+| `allowedHosts` | `['localhost', '127.0.0.1', '[::1]']` | In a browser, keys are only reported on these hostnames (exact match, no port; IPv6 in brackets, as `location.hostname` gives it). Add your staging host here. Outside a browser (server rendering, a prerender script) keys are reported whenever `trackUsage` is on. |
+| `flushIntervalMs` | `30000` | How long keys are collected before they are sent (at least `1000`). |
+
+How it works:
+
+- Every `t()` lookup is recorded with the key exactly as i18next looks it up —
+  `items_other` for a plural, `nav.home` for a nested key — and the server
+  maps it to the key in your project. Each key is sent at most once per page
+  load.
+- Keys are sent per namespace, at most 1,000 per request, every
+  `flushIntervalMs` and when the page is hidden or closed (with `keepalive`,
+  so they are not lost when the tab closes):
+
+  ```
+  POST {apiBaseUrl}/public/projects/{projectSlug}/used/{namespace}
+  Authorization: Bearer {apiKey}
+  Content-Type: application/json
+
+  ["welcome", "items_one", "nav.home"]
+  ```
+
+- Tracking never throws into your app and never changes what `t()` returns.
+  If the API rejects the key (401/403), it warns once and stops for the page.
+  Rate limits wait for `Retry-After`; server and network errors are retried on
+  the next flush, up to three attempts.
+- Setting `trackUsage` without both `apiBaseUrl` and `apiKey` is an init error.
+
+More in the docs: https://localize.work/docs/sdk/usage-tracking/
 
 ## Variant locales (sparse overrides) and 404 behavior
 

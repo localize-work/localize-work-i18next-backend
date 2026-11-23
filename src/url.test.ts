@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { cdnUrl, latestManifestUrl, missingUrl } from './url.js';
+import { cdnUrl, latestManifestUrl, missingUrl, usedUrl } from './url.js';
 
 test('latestManifestUrl addresses the atomic release pointer', () => {
   assert.equal(
@@ -38,5 +38,16 @@ test('missingUrl matches the saveMissing endpoint contract', () => {
   assert.equal(
     missingUrl('https://api.localize.work/', 'doc-in-pocket', 'et', 'common'),
     'https://api.localize.work/public/projects/doc-in-pocket/missing/et/common',
+  );
+});
+
+test('usedUrl matches the key-usage endpoint contract', () => {
+  assert.equal(
+    usedUrl('https://api.localize.work/', 'doc-in-pocket', 'common'),
+    'https://api.localize.work/public/projects/doc-in-pocket/used/common',
+  );
+  assert.equal(
+    usedUrl('https://api.localize.work', 'a b', 'name/space'),
+    'https://api.localize.work/public/projects/a%20b/used/name%2Fspace',
   );
 });

@@ -1,5 +1,5 @@
 export { LocalizeBackend, LocalizeBackend as default } from './backend.js';
-export { cdnUrl, latestManifestUrl, missingUrl } from './url.js';
+export { cdnUrl, latestManifestUrl, missingUrl, usedUrl } from './url.js';
 export type { CdnUrlOptions } from './url.js';
 export type {
   CdnBackendOptions,
@@ -7,4 +7,5 @@ export type {
   LoadPath,
   LoadPathBackendOptions,
   LocalizeBackendOptions,
+  TrackUsageOptions,
 } from './options.js';

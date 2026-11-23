@@ -4,6 +4,7 @@
  *   CDN pointer:  {cdnBaseUrl}/{projectSlug}/latest.json
  *   CDN read:     {cdnBaseUrl}/{projectSlug}/{version}/{locale}/{namespace}.json
  *   saveMissing:  POST {apiBaseUrl}/public/projects/{projectSlug}/missing/{locale}/{namespace}
+ *   key usage:    POST {apiBaseUrl}/public/projects/{projectSlug}/used/{namespace}
  *
  * `version` is an immutable release version (`v3`). Mutable `latest` is first
  * resolved through latestManifestUrl().
@@ -43,4 +44,10 @@ export function missingUrl(
 ): string {
   const base = trimTrailingSlash(apiBaseUrl);
   return `${base}/public/projects/${seg(projectSlug)}/missing/${seg(language)}/${seg(namespace)}`;
+}
+
+/** Key-usage endpoint URL for a namespace (see the `trackUsage` option). */
+export function usedUrl(apiBaseUrl: string, projectSlug: string, namespace: string): string {
+  const base = trimTrailingSlash(apiBaseUrl);
+  return `${base}/public/projects/${seg(projectSlug)}/used/${seg(namespace)}`;
 }

@@ -37,6 +37,36 @@ interface CommonOptions {
   fetchOptions?: RequestInit;
   /** Observability hook — called on every failed CDN load, including sparse 404s. */
   onFailedLoad?: (info: FailedLoadInfo) => void;
+  /**
+   * Report which keys the app looks up, so the editor can show unused keys.
+   * Dev/staging only. Needs `apiBaseUrl` and `apiKey`.
+   *
+   * `true` uses the defaults; an object adjusts them. In a browser, keys are
+   * only reported on the hosts in `allowedHosts` (by default `localhost`,
+   * `127.0.0.1` and `[::1]`); outside a browser they are reported whenever
+   * this is on. Each key is sent at most once per page load.
+   *
+   * @see https://localize.work/docs/sdk/usage-tracking/
+   */
+  trackUsage?: boolean | TrackUsageOptions;
+}
+
+/** Settings for `trackUsage`. */
+export interface TrackUsageOptions {
+  /**
+   * Hostnames (`window.location.hostname`, e.g. `'staging.example.com'`)
+   * where a browser reports key usage. Exact matches only, no port. An IPv6
+   * address is written in brackets, as the browser reports it: `'[::1]'`.
+   * Has no effect outside a browser.
+   * @default ['localhost', '127.0.0.1', '[::1]']
+   */
+  allowedHosts?: string[];
+  /**
+   * How long to collect keys before sending them, in milliseconds (at least
+   * 1000). Keys are also sent when the page is hidden or closed.
+   * @default 30000
+   */
+  flushIntervalMs?: number;
 }
 
 export interface CdnBackendOptions extends CommonOptions {
@@ -63,7 +93,20 @@ export interface ResolvedOptions extends CommonOptions {
   cdnBaseUrl?: string;
   loadPath?: LoadPath;
   saveMissingEnabled: boolean;
+  /** Set only when usage tracking is on; apiBaseUrl and apiKey are then set too. */
+  trackUsage?: ResolvedTrackUsage;
 }
+
+export interface ResolvedTrackUsage {
+  allowedHosts: string[];
+  flushIntervalMs: number;
+}
+
+export const DEFAULT_ALLOWED_HOSTS: readonly string[] = ['localhost', '127.0.0.1', '[::1]'];
+export const DEFAULT_FLUSH_INTERVAL_MS = 30_000;
+const MIN_FLUSH_INTERVAL_MS = 1_000;
+/** Longest delay setTimeout honors; larger values fire at once. */
+const MAX_FLUSH_INTERVAL_MS = 2_147_483_647;
 
 const PREFIX = '[@localize-work/i18next-backend]';
 
@@ -114,6 +157,8 @@ export function validateOptions(raw: unknown): ResolvedOptions {
     : undefined;
   const apiKey = hasApiKey ? requireNonEmptyString(o.apiKey, 'apiKey') : undefined;
 
+  const trackUsage = resolveTrackUsage(o.trackUsage, apiBaseUrl !== undefined && apiKey !== undefined);
+
   if (typeof fetch !== 'function') {
     fail('global fetch is not available — Node 18+ or a browser is required');
   }
@@ -129,5 +174,52 @@ export function validateOptions(raw: unknown): ResolvedOptions {
     fetchOptions: o.fetchOptions,
     onFailedLoad: o.onFailedLoad,
     saveMissingEnabled: apiBaseUrl !== undefined && apiKey !== undefined,
+    trackUsage,
   };
+}
+
+function resolveTrackUsage(raw: unknown, hasApi: boolean): ResolvedTrackUsage | undefined {
+  if (raw === undefined || raw === false) return undefined;
+  if (raw !== true && (raw === null || typeof raw !== 'object' || Array.isArray(raw))) {
+    fail(
+      `\`trackUsage\` must be true, false or { allowedHosts, flushIntervalMs } (got ${JSON.stringify(raw)})`,
+    );
+  }
+  if (!hasApi) {
+    fail(
+      'trackUsage needs BOTH `apiBaseUrl` and `apiKey` — set them, or turn trackUsage off.',
+    );
+  }
+  const o: TrackUsageOptions = raw === true ? {} : (raw as TrackUsageOptions);
+
+  let allowedHosts = [...DEFAULT_ALLOWED_HOSTS];
+  if (o.allowedHosts !== undefined) {
+    if (
+      !Array.isArray(o.allowedHosts) ||
+      !o.allowedHosts.every((host) => typeof host === 'string' && host.trim() !== '')
+    ) {
+      fail(
+        `\`trackUsage.allowedHosts\` must be an array of hostnames (got ${JSON.stringify(o.allowedHosts)})`,
+      );
+    }
+    allowedHosts = o.allowedHosts.map((host) => host.trim().toLowerCase());
+  }
+
+  let flushIntervalMs = DEFAULT_FLUSH_INTERVAL_MS;
+  if (o.flushIntervalMs !== undefined) {
+    if (
+      typeof o.flushIntervalMs !== 'number' ||
+      !Number.isFinite(o.flushIntervalMs) ||
+      o.flushIntervalMs < MIN_FLUSH_INTERVAL_MS ||
+      o.flushIntervalMs > MAX_FLUSH_INTERVAL_MS
+    ) {
+      fail(
+        `\`trackUsage.flushIntervalMs\` must be a number of milliseconds from ${MIN_FLUSH_INTERVAL_MS} ` +
+          `to ${MAX_FLUSH_INTERVAL_MS} (got ${JSON.stringify(o.flushIntervalMs)})`,
+      );
+    }
+    flushIntervalMs = o.flushIntervalMs;
+  }
+
+  return { allowedHosts, flushIntervalMs };
 }
