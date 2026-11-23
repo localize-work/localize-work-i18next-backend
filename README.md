@@ -235,7 +235,7 @@ await i18next.use(LocalizeBackend).init({
 
 | `trackUsage` setting | Default | Meaning |
 |---|---|---|
-| `allowedHosts` | `['localhost', '127.0.0.1', '[::1]']` | In a browser, keys are only reported on these hostnames (exact match, no port; IPv6 in brackets, as `location.hostname` gives it). Add your staging host here. Where there is no hostname — server rendering, a prerender script, React Native, `file:` pages in Electron — keys are reported whenever `trackUsage` is on. |
+| `allowedHosts` | `['localhost', '127.0.0.1', '[::1]']` | In a browser, keys are only reported on these hostnames (exact match, no port; IPv6 in brackets, as `location.hostname` gives it). Add your staging host here. A blob: worker or an about:srcdoc frame is checked by the hostname of the page that made it. A page with an opaque origin (`file:` pages in Electron, `data:` workers) is checked by its protocol: add `'file:'` to report from `file:` pages. Where there is no web address at all — server rendering, a prerender script, React Native — keys are reported whenever `trackUsage` is on, so turn it on only in development and staging builds there. |
 | `flushIntervalMs` | `30000` | How long keys are collected before they are sent (at least `1000`). |
 
 How it works:
@@ -246,7 +246,8 @@ How it works:
   load, and again if it is still looked up six hours later (a long-running
   server or tab).
 - Keys are sent per namespace, at most 1,000 per request, every
-  `flushIntervalMs` and when the page is hidden or closed. In a browser, each
+  `flushIntervalMs` and when the page is hidden or closed. A request still
+  unanswered after 30 seconds is abandoned and retried like a network error. In a browser, each
   request is cut to fit the 64 KiB browsers allow for `keepalive` requests on
   a page, and uses `keepalive` while the page's budget lasts, so a report in
   flight is not lost when the tab closes:

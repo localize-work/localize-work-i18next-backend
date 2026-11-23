@@ -43,9 +43,9 @@ interface CommonOptions {
    *
    * `true` uses the defaults; an object adjusts them. In a browser, keys are
    * only reported on the hosts in `allowedHosts` (by default `localhost`,
-   * `127.0.0.1` and `[::1]`); where there is no hostname (server rendering,
-   * React Native, `file:` pages) they are reported whenever this is on. Each
-   * key is sent at most once per page load.
+   * `127.0.0.1` and `[::1]`); where there is no web address at all (server
+   * rendering, React Native) they are reported whenever this is on. Each key
+   * is sent at most once per page load.
    *
    * @see https://localize.work/docs/sdk/usage-tracking/
    */
@@ -58,8 +58,10 @@ export interface TrackUsageOptions {
    * Hostnames (`window.location.hostname`, e.g. `'staging.example.com'`)
    * where a browser reports key usage. Exact matches only, no port. An IPv6
    * address is written in brackets, as the browser reports it: `'[::1]'`.
-   * Has no effect where there is no hostname: outside a browser, in React
-   * Native, and on `file:` pages.
+   * A blob: worker or about:srcdoc frame is checked by the hostname of the
+   * page that made it; a page with an opaque origin by its protocol, so add
+   * `'file:'` to report from Electron `file:` pages. Has no effect where
+   * there is no web address: outside a browser and in React Native.
    * @default ['localhost', '127.0.0.1', '[::1]']
    */
   allowedHosts?: string[];

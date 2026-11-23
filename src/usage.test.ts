@@ -6,7 +6,12 @@ import i18next, { type i18n, type InitOptions, type Services } from 'i18next';
 import { JSDOM } from 'jsdom';
 import { LocalizeBackend } from './backend.js';
 import type { LocalizeBackendOptions, TrackUsageOptions } from './options.js';
-import { resetUsageTracking, UsageTracker } from './usage.js';
+import {
+  resetUsageTracking,
+  USAGE_REQUEST_TIMEOUT_MS,
+  UsageTracker,
+  utf8Length,
+} from './usage.js';
 
 const CDN = 'https://cdn.localize.work';
 const API = 'https://api.localize.work';
@@ -863,8 +868,10 @@ test('a retired tracker drops its exit listener before its last send settles', a
 
 test('without a web address (React Native, file: pages) keys are reported when enabled', async (t) => {
   const calls = mockFetch();
-  for (const scope of [{}, { location: { hostname: '' } }]) {
+  if (!savedGlobals.has('window')) {
     savedGlobals.set('window', (globalThis as Record<string, unknown>).window);
+  }
+  for (const scope of [{}, { location: { hostname: '' } }]) {
     (globalThis as Record<string, unknown>).window = scope;
     resetUsageTracking();
     calls.length = 0;
@@ -875,4 +882,155 @@ test('without a web address (React Native, file: pages) keys are reported when e
     await advance(t, 30_000);
     assert.equal(calls.length, 1, JSON.stringify(scope));
   }
+});
+
+test('pages without a host of their own are checked by the origin they inherit, or their protocol', async (t) => {
+  const calls = mockFetch();
+  const cases: [string, Record<string, unknown>, boolean | TrackUsageOptions, boolean][] = [
+    // A blob: worker or srcdoc frame made by a production page is that page.
+    [
+      'blob worker of a production page',
+      { hostname: '', origin: 'https://app.shop.example', protocol: 'blob:' },
+      true,
+      false,
+    ],
+    [
+      'blob worker of an allowed staging page',
+      { hostname: '', origin: 'https://staging.shop.example', protocol: 'blob:' },
+      { allowedHosts: ['staging.shop.example'] },
+      true,
+    ],
+    [
+      'srcdoc frame of a localhost page',
+      { hostname: '', origin: 'http://localhost:5173', protocol: 'about:' },
+      true,
+      true,
+    ],
+    // Opaque origins report only when their protocol is allowed.
+    ['file: page', { hostname: '', origin: 'file://', protocol: 'file:' }, true, false],
+    [
+      'file: page allowed',
+      { hostname: '', origin: 'file://', protocol: 'file:' },
+      { allowedHosts: ['file:'] },
+      true,
+    ],
+    ['data: worker', { hostname: '', origin: 'null', protocol: 'data:' }, true, false],
+  ];
+  if (!savedGlobals.has('window')) {
+    savedGlobals.set('window', (globalThis as Record<string, unknown>).window);
+  }
+  for (const [label, location, trackUsage, reports] of cases) {
+    (globalThis as Record<string, unknown>).window = { location };
+    resetUsageTracking();
+    calls.length = 0;
+    t.mock.timers.reset();
+    const instance = await makeI18n(trackUsage);
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    instance.t('a.b');
+    await advance(t, 30_000);
+    assert.equal(calls.length, reports ? 1 : 0, label);
+  }
+});
+
+test('a request left unanswered is abandoned and retried, so reporting goes on', async (t) => {
+  let hang = true;
+  const calls = mockFetch((call) =>
+    hang
+      ? (new Promise<Response>((_, reject) => {
+          call.init.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+        }) as unknown as Response)
+      : ok(),
+  );
+  const instance = await makeI18n({ flushIntervalMs: 1_000 });
+  useFakeTimers(t);
+  instance.t('a.b');
+  await advance(t, 1_000);
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0]!.init.signal, 'the request can be aborted');
+  hang = false;
+  await advance(t, USAGE_REQUEST_TIMEOUT_MS);
+  await advance(t, 1_000);
+  assert.deepEqual(
+    calls.map((call) => call.names),
+    [['a.b'], ['a.b']],
+  );
+});
+
+test('a request whose fetch ignores the abort signal still times out', async (t) => {
+  let hang = true;
+  const calls = mockFetch(() =>
+    hang ? (new Promise<Response>(() => {}) as unknown as Response) : ok(),
+  );
+  const instance = await makeI18n({ flushIntervalMs: 1_000 });
+  useFakeTimers(t);
+  instance.t('a.b');
+  await advance(t, 1_000);
+  hang = false;
+  await advance(t, USAGE_REQUEST_TIMEOUT_MS);
+  instance.t('onlyEn');
+  await advance(t, 1_000);
+  assert.deepEqual(
+    calls.map((call) => call.names),
+    [['a.b'], ['a.b'], ['onlyEn']],
+  );
+});
+
+test('re-initializing an i18next instance retires the tracker of its previous settings', async (t) => {
+  const calls = mockFetch();
+  const instance = await makeI18n();
+  const listenersBefore = process.listenerCount('beforeExit');
+  instance.t('a.b');
+  // i18next builds a new resource store and a new backend on init().
+  await instance.init({
+    lng: 'et',
+    fallbackLng: 'en',
+    ns: ['common', 'admin'],
+    defaultNS: 'common',
+    backend: { ...devOptions, apiKey: 'pk_rotated', trackUsage: true },
+  });
+  await settle();
+  assert.equal(process.listenerCount('beforeExit'), listenersBefore, 'no tracker is left behind');
+  useFakeTimers(t);
+  instance.t('onlyEn');
+  await advance(t, 30_000);
+  assert.deepEqual(
+    calls.map((call) => [call.names, (call.init.headers as Record<string, string>).Authorization]),
+    [
+      [['a.b'], 'Bearer pk_test_123'],
+      [['onlyEn'], 'Bearer pk_rotated'],
+    ],
+  );
+});
+
+test('UTF-8 sizes are counted without TextEncoder', () => {
+  const lone = JSON.stringify(`lone ${String.fromCharCode(0xd800)}`);
+  for (const text of ['', 'abc', 'õun', '€', '日本語', '😀 emoji', lone]) {
+    assert.equal(utf8Length(text), Buffer.byteLength(text, 'utf8'), text);
+  }
+});
+
+test('without TextEncoder (older React Native) keys are still sent', () => {
+  const result = spawnSync(
+    process.execPath,
+    [
+      '--import',
+      'tsx',
+      '--input-type=module',
+      '--eval',
+      [
+        'delete globalThis.TextEncoder;',
+        'globalThis.window = {};',
+        'let sent = 0;',
+        'globalThis.fetch = async () => { sent++; return new Response("{}", { status: 200 }); };',
+        "const { UsageTracker } = await import('./src/usage.ts');",
+        "const tracker = new UsageTracker({ apiBaseUrl: 'https://api.example', apiKey: 'pk', projectSlug: 'p', flushIntervalMs: 1000 });",
+        "tracker.record('common', 'a.b');",
+        'await tracker.flush();',
+        'tracker.stop();',
+        'if (sent !== 1) process.exit(2);',
+      ].join(' '),
+    ],
+    { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' },
+  );
+  assert.equal(result.status, 0, result.stderr);
 });

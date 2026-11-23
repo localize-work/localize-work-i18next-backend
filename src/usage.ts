@@ -45,6 +45,11 @@ export const USAGE_REPORT_AGAIN_MS = 6 * 60 * 60 * 1000;
 const USAGE_RATE_LIMIT_FALLBACK_MS = 60_000;
 /** Shortest wait after a 429, whatever its Retry-After says ("0", a past date). */
 const USAGE_RATE_LIMIT_MIN_MS = 1_000;
+/**
+ * A request still unanswered after this long is abandoned and counted as a
+ * failed attempt, so a connection a proxy holds open cannot stall reporting.
+ */
+export const USAGE_REQUEST_TIMEOUT_MS = 30_000;
 /** Before a Node process exits: how many rate-limit waits, and the longest one. */
 const EXIT_MAX_WAITS = 2;
 const EXIT_MAX_WAIT_MS = 65_000;
@@ -84,13 +89,32 @@ interface HookableStore {
   [STORE_HOOK]?: StoreHook;
 }
 
-// Created on first use: importing the backend must work in a runtime
-// without TextEncoder when tracking is off.
-let encoder: TextEncoder | undefined;
+/**
+ * UTF-8 length of a string, counted by hand: React Native (Hermes) has no
+ * TextEncoder in older releases, and tracking must work there.
+ * JSON.stringify escapes lone surrogates, so every surrogate here is paired.
+ */
+export function utf8Length(text: string): number {
+  let bytes = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (
+      code >= 0xd800 &&
+      code <= 0xdbff &&
+      i + 1 < text.length &&
+      (text.charCodeAt(i + 1) & 0xfc00) === 0xdc00
+    ) {
+      bytes += 4;
+      i++;
+    } else bytes += 3;
+  }
+  return bytes;
+}
 
 function jsonBytes(value: string): number {
-  encoder ??= new TextEncoder();
-  return encoder.encode(JSON.stringify(value)).byteLength;
+  return utf8Length(JSON.stringify(value));
 }
 
 /**
@@ -386,7 +410,7 @@ export class UsageTracker {
     let response: Response;
     if (keepalive) keepaliveInFlight += batch.bytes;
     try {
-      response = await fetch(url, {
+      response = await fetchWithTimeout(url, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${this.config.apiKey}`,
@@ -444,6 +468,30 @@ export class UsageTracker {
     }
     batch.round = round + 1;
     this.batches.push(batch);
+  }
+}
+
+/**
+ * fetch that gives up after USAGE_REQUEST_TIMEOUT_MS. The race also covers a
+ * fetch that ignores the abort signal, so the flush loop always moves on.
+ */
+async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  const controller = typeof AbortController === 'function' ? new AbortController() : undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller?.abort();
+      reject(new Error(`no answer within ${USAGE_REQUEST_TIMEOUT_MS} ms`));
+    }, USAGE_REQUEST_TIMEOUT_MS);
+    unref(timer);
+  });
+  try {
+    return await Promise.race([
+      fetch(url, controller ? { ...init, signal: controller.signal } : init),
+      timedOut,
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -520,13 +568,19 @@ export function resetUsageTracking(): void {
 }
 
 /**
- * The hostname of the page this runs in — a window or a worker — or
- * undefined where there is none: outside a browser, and in runtimes that
- * have a `window` without a web address, such as React Native, or pages
- * without a host, such as `file:` pages in Electron. allowedHosts applies
- * only to pages with a hostname.
+ * What allowedHosts is checked against for the page or worker this runs in:
+ *
+ * - its hostname;
+ * - for a page or worker without a host of its own (a blob: worker, an
+ *   about:srcdoc or about:blank frame), the hostname of the origin it
+ *   inherits from the page that made it;
+ * - for an opaque origin (file: pages, data: workers, sandboxed frames), its
+ *   protocol, such as `'file:'`, which no default allows;
+ * - undefined where there is no web address at all: outside a browser, and
+ *   in runtimes with a `window` but no `location.protocol`, such as React
+ *   Native. allowedHosts does not apply there.
  */
-function browserHostname(): string | undefined {
+function pageHost(): string | undefined {
   const scope =
     typeof window !== 'undefined'
       ? window
@@ -535,8 +589,23 @@ function browserHostname(): string | undefined {
         ? self
         : undefined;
   if (!scope) return undefined;
-  const hostname = (scope as { location?: { hostname?: unknown } }).location?.hostname;
-  return typeof hostname === 'string' && hostname !== '' ? hostname : undefined;
+  const location = (scope as { location?: unknown }).location;
+  if (location === null || typeof location !== 'object') return undefined;
+  const { hostname, origin, protocol } = location as {
+    hostname?: unknown;
+    origin?: unknown;
+    protocol?: unknown;
+  };
+  if (typeof hostname === 'string' && hostname !== '') return hostname;
+  if (typeof origin === 'string' && origin !== 'null') {
+    try {
+      const inherited = new URL(origin).hostname;
+      if (inherited !== '') return inherited;
+    } catch {
+      // Not a URL: fall through to the protocol.
+    }
+  }
+  return typeof protocol === 'string' && protocol !== '' ? protocol : undefined;
 }
 
 /**
@@ -599,8 +668,8 @@ export function startUsageTracking(
 ): (() => void) | undefined {
   const settings = options.trackUsage;
   if (!settings || !options.apiBaseUrl || !options.apiKey) return undefined;
-  const hostname = browserHostname();
-  if (hostname !== undefined && !settings.allowedHosts.includes(hostname.toLowerCase())) {
+  const host = pageHost();
+  if (host !== undefined && !settings.allowedHosts.includes(host.toLowerCase())) {
     return undefined;
   }
   if (

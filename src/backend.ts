@@ -75,6 +75,14 @@ class LatestResolutionError extends Error {
 }
 
 /**
+ * Unhooks the usage tracking of each i18next instance, keyed by its
+ * `services` object: i18next keeps that object across init() calls, while
+ * the resource store and (for a registered class) the backend are new each
+ * time.
+ */
+const usageByInstance = new WeakMap<object, () => void>();
+
+/**
  * i18next backend plugin for localize.work.
  *
  * read(): resolves the atomic latest pointer once (unless version-pinned), then
@@ -105,11 +113,6 @@ export class LocalizeBackend implements BackendModule<LocalizeBackendOptions> {
   private flushScheduled = false;
   /** One initialized backend uses one release across every locale/namespace read. */
   private latestVersion: Promise<string> | undefined;
-  /**
-   * Unhooks this backend's usage tracking, per resource store: one backend
-   * object can serve several i18next instances, each with its own store.
-   */
-  private detachUsage = new WeakMap<object, () => void>();
 
   constructor(services?: Services, options?: LocalizeBackendOptions, i18nextOptions?: InitOptions) {
     // i18next constructs plugin classes with no arguments and calls init()
@@ -122,20 +125,21 @@ export class LocalizeBackend implements BackendModule<LocalizeBackendOptions> {
   init(services: Services, backendOptions: LocalizeBackendOptions, _i18nextOptions: InitOptions): void {
     this.options = validateOptions(backendOptions);
     this.latestVersion = undefined;
-    // A second init() for the same store replaces the first one's settings,
-    // usage tracking included; another i18next instance sharing this backend
-    // object keeps its own. Attach the new settings before detaching the old
-    // ones, so unchanged settings keep their tracker (and what it already
-    // reported) instead of retiring it and starting over.
+    // A second init() of the same i18next instance replaces the first one's
+    // settings, usage tracking included, even though i18next then hands over
+    // a new resource store and usually a new backend object; another
+    // instance sharing this backend object keeps its own. Attach the new
+    // settings before detaching the old ones, so unchanged settings keep
+    // their tracker (and what it already reported) instead of retiring it.
     const store: unknown = services?.resourceStore;
-    const storeKey = typeof store === 'object' && store !== null ? store : undefined;
-    const previous = storeKey ? this.detachUsage.get(storeKey) : undefined;
+    const instanceKey = typeof services === 'object' && services !== null ? services : undefined;
+    const previous = instanceKey ? usageByInstance.get(instanceKey) : undefined;
     const detach = this.options.trackUsage
       ? startUsageTracking(store, this.options)
       : undefined;
-    if (storeKey) {
-      if (detach) this.detachUsage.set(storeKey, detach);
-      else this.detachUsage.delete(storeKey);
+    if (instanceKey) {
+      if (detach) usageByInstance.set(instanceKey, detach);
+      else usageByInstance.delete(instanceKey);
     }
     previous?.();
   }
