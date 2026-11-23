@@ -119,11 +119,15 @@ export class LocalizeBackend implements BackendModule<LocalizeBackendOptions> {
   init(services: Services, backendOptions: LocalizeBackendOptions, _i18nextOptions: InitOptions): void {
     this.options = validateOptions(backendOptions);
     this.latestVersion = undefined;
-    // A second init() replaces the first one's settings, usage tracking included.
-    this.detachUsage?.();
+    // A second init() replaces the first one's settings, usage tracking
+    // included. Attach the new settings before detaching the old ones, so
+    // unchanged settings keep their tracker (and what it already reported)
+    // instead of retiring it and starting over.
+    const previous = this.detachUsage;
     this.detachUsage = this.options.trackUsage
       ? startUsageTracking(services?.resourceStore, this.options)
       : undefined;
+    previous?.();
   }
 
   read(language: string, namespace: string, callback: ReadCallback): void {

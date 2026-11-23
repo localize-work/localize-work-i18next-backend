@@ -649,3 +649,120 @@ test('other 4xx responses drop the batch with one warning', async (t) => {
   );
   assert.equal(warnings.length, 1);
 });
+
+// --- round 2 ------------------------------------------------------------------
+
+test('a Retry-After of 0 still waits: the batch goes to a later flush', async (t) => {
+  let rateLimited = 3;
+  const calls = mockFetch(() =>
+    rateLimited-- > 0 ? json({ error: 'rate_limited' }, 429, { 'Retry-After': '0' }) : ok(),
+  );
+  const instance = await makeI18n({ flushIntervalMs: 1_000 });
+  useFakeTimers(t);
+  instance.t('a.b');
+  await advance(t, 1_000);
+  assert.equal(calls.length, 1, 'one request per flush, not a resend loop');
+  await advance(t, 999);
+  assert.equal(calls.length, 1);
+  await advance(t, 1);
+  assert.equal(calls.length, 2);
+});
+
+test('a key recorded right after a capacity sweep is queued once', async (t) => {
+  const calls = mockFetch();
+  silenceWarnings(t);
+  const instance = await makeI18n();
+  useFakeTimers(t);
+  const store = storeOf(instance);
+  for (let i = 0; i < 50_000; i++) store.getResource('et', 'common', `k${i}`);
+  await advance(t, 30_000);
+  calls.length = 0;
+  await advance(t, 6 * 60 * 60 * 1000);
+  store.getResource('et', 'common', 'new');
+  store.getResource('et', 'common', 'new');
+  await advance(t, 30_000);
+  assert.deepEqual(
+    calls.map((call) => call.names),
+    [['new']],
+  );
+});
+
+test('names containing NUL are not reported', async (t) => {
+  const calls = mockFetch();
+  const instance = await makeI18n();
+  useFakeTimers(t);
+  const store = storeOf(instance);
+  store.getResource('et', 'common', 'bad\u0000key');
+  store.getResource('et', 'common', 'good');
+  await advance(t, 30_000);
+  assert.deepEqual(
+    calls.map((call) => call.names),
+    [['good']],
+  );
+});
+
+test('in a browser, a timer request is keepalive, so closing the page mid-request keeps it', async (t) => {
+  const pending: ((response: Response) => void)[] = [];
+  const calls = mockFetch(
+    () => new Promise<Response>((resolve) => pending.push(resolve)) as unknown as Response,
+  );
+  const dom = useBrowser('http://localhost:5173/');
+  const instance = await makeI18n();
+  useFakeTimers(t);
+  instance.t('a.b');
+  await advance(t, 30_000);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.init.keepalive, true);
+
+  // The page goes away while that request is open; a key queued since then
+  // is sent with the keepalive budget left over.
+  instance.t('onlyEn');
+  dom.window.dispatchEvent(new dom.window.Event('pagehide'));
+  await settle();
+  assert.deepEqual(
+    calls.map((call) => [call.names, call.init.keepalive]),
+    [
+      [['a.b'], true],
+      [['onlyEn'], true],
+    ],
+  );
+  for (const resolve of pending) resolve(ok());
+  await settle();
+});
+
+test('re-initializing with new settings retires the old tracker after sending its queue', async (t) => {
+  const calls = mockFetch();
+  const instance = await makeI18n();
+  const backend = instance.services.backendConnector.backend as LocalizeBackend;
+  const listenersBefore = process.listenerCount('beforeExit');
+  useFakeTimers(t);
+  instance.t('a.b');
+  for (let i = 0; i < 12; i++) {
+    backend.init(
+      instance.services,
+      { ...devOptions, apiKey: `pk_test_${i}`, trackUsage: true },
+      {} as InitOptions,
+    );
+  }
+  await settle();
+  assert.ok(
+    process.listenerCount('beforeExit') <= listenersBefore,
+    'retired trackers remove their listeners',
+  );
+  assert.deepEqual(
+    calls.map((call) => [call.names, (call.init.headers as Record<string, string>).Authorization]),
+    [[['a.b'], 'Bearer pk_test_123']],
+    'the queue of the retired tracker is sent once, with its own key',
+  );
+
+  // Unchanged settings keep the tracker: a key it reported is not sent again.
+  instance.t('onlyEn');
+  await advance(t, 30_000);
+  backend.init(instance.services, { ...devOptions, apiKey: 'pk_test_11', trackUsage: true }, {} as InitOptions);
+  instance.t('onlyEn');
+  await advance(t, 30_000);
+  assert.deepEqual(
+    calls.slice(1).map((call) => call.names),
+    [['onlyEn']],
+  );
+});

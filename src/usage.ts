@@ -39,6 +39,8 @@ export const USAGE_MAX_TRACKED_NAMES = 50_000;
 export const USAGE_REPORT_AGAIN_MS = 6 * 60 * 60 * 1000;
 /** Wait after a 429 whose Retry-After the response did not expose. */
 const USAGE_RATE_LIMIT_FALLBACK_MS = 60_000;
+/** Shortest wait after a 429, whatever its Retry-After says ("0", a past date). */
+const USAGE_RATE_LIMIT_MIN_MS = 1_000;
 /** Before a Node process exits: how many rate-limit waits, and the longest one. */
 const EXIT_MAX_WAITS = 2;
 const EXIT_MAX_WAIT_MS = 65_000;
@@ -141,6 +143,10 @@ export class UsageTracker {
   private warnedCap = false;
   private warnedLongName = false;
   private removeExitListeners: (() => void) | undefined;
+  /** Bytes of keepalive request bodies still in flight (browsers cap the total). */
+  private keepaliveInFlight = 0;
+  /** Resource stores this tracker is attached to, counted per backend. */
+  attachments = 0;
 
   constructor(private readonly config: TrackerConfig) {
     this.removeExitListeners = listenForExit((mode) => void this.flush(mode));
@@ -157,7 +163,11 @@ export class UsageTracker {
     let names = this.seen.get(namespace);
     const recordedAt = names?.get(key);
     if (recordedAt !== undefined && now - recordedAt < USAGE_REPORT_AGAIN_MS) return;
-    if (recordedAt === undefined && this.seenCount >= USAGE_MAX_TRACKED_NAMES) this.sweep(now);
+    if (recordedAt === undefined && this.seenCount >= USAGE_MAX_TRACKED_NAMES) {
+      this.sweep(now);
+      // The sweep may have dropped this namespace's map.
+      names = this.seen.get(namespace);
+    }
     if (recordedAt === undefined && this.seenCount >= USAGE_MAX_TRACKED_NAMES) {
       if (!this.warnedCap) {
         this.warnedCap = true;
@@ -173,6 +183,8 @@ export class UsageTracker {
     }
     names.set(key, now);
     if (recordedAt === undefined) this.seenCount++;
+    // No key name contains NUL (the API stores names as PostgreSQL text).
+    if (key.includes('\u0000')) return;
     if (key.length > USAGE_MAX_NAME_LENGTH) {
       if (!this.warnedLongName) {
         this.warnedLongName = true;
@@ -275,6 +287,19 @@ export class UsageTracker {
     this.removeExitListeners = undefined;
   }
 
+  /** Send what is queued once, without waiting out rate limits, then stop. */
+  async retire(): Promise<void> {
+    if (this.stopped) return;
+    if (this.timer !== undefined) clearTimeout(this.timer);
+    this.timer = undefined;
+    try {
+      await this.send('exit');
+    } catch (error) {
+      console.warn(`${PREFIX} trackUsage failed sending keys:`, error);
+    }
+    this.stop();
+  }
+
   private hasWork(): boolean {
     return this.pending.size > 0 || this.batches.length > 0;
   }
@@ -315,7 +340,8 @@ export class UsageTracker {
       // pages may be discarded without another event, so this is the last
       // chance. Bodies within the keepalive budget outlive the page.
       const batches = this.batches.splice(0);
-      let keepaliveBudget = mode === 'pagehide' ? KEEPALIVE_BUDGET_BYTES : 0;
+      let keepaliveBudget =
+        mode === 'pagehide' ? KEEPALIVE_BUDGET_BYTES - this.keepaliveInFlight : 0;
       await Promise.all(
         batches.map((batch) => {
           const keepalive = batch.bytes <= keepaliveBudget;
@@ -333,13 +359,19 @@ export class UsageTracker {
       const index = this.batches.findIndex((batch) => batch.round <= round);
       if (index === -1) return;
       const [batch] = this.batches.splice(index, 1);
-      await this.post(batch!, round, false);
+      // In a browser, a timer request is keepalive when it fits, so a page
+      // closed while it is in flight still delivers it: the page-hide flush
+      // only sends what is still queued.
+      const keepalive =
+        isBrowserPage() && batch!.bytes <= KEEPALIVE_BUDGET_BYTES - this.keepaliveInFlight;
+      await this.post(batch!, round, keepalive);
     }
   }
 
   private async post(batch: Batch, round: number, keepalive: boolean): Promise<void> {
     const url = usedUrl(this.config.apiBaseUrl, this.config.projectSlug, batch.namespace);
     let response: Response;
+    if (keepalive) this.keepaliveInFlight += batch.bytes;
     try {
       response = await fetch(url, {
         method: 'POST',
@@ -353,6 +385,8 @@ export class UsageTracker {
     } catch (error) {
       this.retryLater(batch, round, url, error);
       return;
+    } finally {
+      if (keepalive) this.keepaliveInFlight -= batch.bytes;
     }
     if (response.ok || this.stopped) return;
 
@@ -368,9 +402,11 @@ export class UsageTracker {
       // Without a readable Retry-After (an older API, or a browser hiding it)
       // wait out the API's whole rate-limit window.
       const wait = response.headers.get('retry-after')
-        ? retryDelayMs(response, 0)
+        ? Math.max(retryDelayMs(response, 0), USAGE_RATE_LIMIT_MIN_MS)
         : USAGE_RATE_LIMIT_FALLBACK_MS;
       this.blockedUntil = Math.max(this.blockedUntil, Date.now() + wait);
+      // A later flush retries it, never this one.
+      batch.round = round + 1;
       this.batches.unshift(batch);
       return;
     }
@@ -398,12 +434,17 @@ export class UsageTracker {
   }
 }
 
+/** A browser page (a window with a document), where keepalive requests apply. */
+function isBrowserPage(): boolean {
+  return typeof window !== 'undefined' && typeof document !== 'undefined';
+}
+
 /**
  * Call `onExit` when the page is hidden or left (browser), or before the
  * process exits (Node). Returns a function that removes the listeners.
  */
 function listenForExit(onExit: (mode: FlushMode) => void): (() => void) | undefined {
-  if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+  if (isBrowserPage()) {
     const onVisibilityChange = () => {
       if (document.visibilityState === 'hidden') onExit('pagehide');
     };
@@ -428,19 +469,34 @@ function listenForExit(onExit: (mode: FlushMode) => void): (() => void) | undefi
 /** One tracker per project and key, shared by every i18next instance on the page. */
 const trackers = new Map<string, UsageTracker>();
 
-function trackerFor(config: TrackerConfig): UsageTracker {
-  const id = JSON.stringify([
+function trackerId(config: TrackerConfig): string {
+  return JSON.stringify([
     config.apiBaseUrl,
     config.projectSlug,
     config.apiKey,
     config.flushIntervalMs,
   ]);
+}
+
+function trackerFor(config: TrackerConfig): UsageTracker {
+  const id = trackerId(config);
   let tracker = trackers.get(id);
   if (!tracker) {
     tracker = new UsageTracker(config);
     trackers.set(id, tracker);
   }
   return tracker;
+}
+
+/**
+ * A tracker no store feeds any more (its backends were re-initialized with
+ * other settings): send what it has queued once, then drop it, its timers
+ * and its listeners, so a long-running process does not collect them.
+ */
+function retireTracker(tracker: UsageTracker, config: TrackerConfig): void {
+  const id = trackerId(config);
+  if (trackers.get(id) === tracker) trackers.delete(id);
+  void tracker.retire();
 }
 
 /** Stops and forgets every tracker. For tests. */
@@ -471,7 +527,11 @@ function browserHostname(): string | undefined {
  * Wrap a resource store's getResource once, however many backends attach to
  * it. Returns a function that detaches `tracker` again.
  */
-function attachToStore(store: HookableStore, tracker: UsageTracker): () => void {
+function attachToStore(
+  store: HookableStore,
+  tracker: UsageTracker,
+  config: TrackerConfig,
+): () => void {
   let hook = store[STORE_HOOK];
   if (!hook) {
     const original = store.getResource;
@@ -499,6 +559,7 @@ function attachToStore(store: HookableStore, tracker: UsageTracker): () => void 
   }
   const trackersOnStore = hook.trackers;
   trackersOnStore.set(tracker, (trackersOnStore.get(tracker) ?? 0) + 1);
+  tracker.attachments++;
   let detached = false;
   return () => {
     if (detached) return;
@@ -506,6 +567,8 @@ function attachToStore(store: HookableStore, tracker: UsageTracker): () => void 
     const count = trackersOnStore.get(tracker) ?? 0;
     if (count <= 1) trackersOnStore.delete(tracker);
     else trackersOnStore.set(tracker, count - 1);
+    tracker.attachments--;
+    if (tracker.attachments <= 0) retireTracker(tracker, config);
   };
 }
 
@@ -535,12 +598,13 @@ export function startUsageTracking(
     );
     return undefined;
   }
-  const tracker = trackerFor({
+  const config: TrackerConfig = {
     apiBaseUrl: options.apiBaseUrl,
     apiKey: options.apiKey,
     projectSlug: options.projectSlug,
     flushIntervalMs: settings.flushIntervalMs,
-  });
+  };
+  const tracker = trackerFor(config);
   if (!tracker.active) return undefined;
-  return attachToStore(resourceStore as HookableStore, tracker);
+  return attachToStore(resourceStore as HookableStore, tracker, config);
 }
