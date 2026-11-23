@@ -43,8 +43,9 @@ interface CommonOptions {
    *
    * `true` uses the defaults; an object adjusts them. In a browser, keys are
    * only reported on the hosts in `allowedHosts` (by default `localhost`,
-   * `127.0.0.1` and `[::1]`); outside a browser they are reported whenever
-   * this is on. Each key is sent at most once per page load.
+   * `127.0.0.1` and `[::1]`); where there is no hostname (server rendering,
+   * React Native, `file:` pages) they are reported whenever this is on. Each
+   * key is sent at most once per page load.
    *
    * @see https://localize.work/docs/sdk/usage-tracking/
    */
@@ -57,7 +58,8 @@ export interface TrackUsageOptions {
    * Hostnames (`window.location.hostname`, e.g. `'staging.example.com'`)
    * where a browser reports key usage. Exact matches only, no port. An IPv6
    * address is written in brackets, as the browser reports it: `'[::1]'`.
-   * Has no effect outside a browser.
+   * Has no effect where there is no hostname: outside a browser, in React
+   * Native, and on `file:` pages.
    * @default ['localhost', '127.0.0.1', '[::1]']
    */
   allowedHosts?: string[];

@@ -26,7 +26,11 @@ export const USAGE_MAX_NAMES_PER_REQUEST = 1_000;
 export const USAGE_MAX_NAME_LENGTH = 512 + '_ordinal_other'.length;
 /** Fastify's default body limit. */
 const USAGE_MAX_BODY_BYTES = 1024 * 1024;
-/** Browsers refuse keepalive requests once their bodies together pass 64 KiB. */
+/**
+ * Browsers refuse keepalive requests once their bodies together pass 64 KiB
+ * per page. In a browser, batches are cut to this size, so each can go out
+ * with keepalive.
+ */
 const KEEPALIVE_BUDGET_BYTES = 60 * 1024;
 export const USAGE_MAX_ATTEMPTS = 3;
 /** Memory cap: names remembered per page before new ones are ignored. */
@@ -89,8 +93,14 @@ function jsonBytes(value: string): number {
   return encoder.encode(JSON.stringify(value)).byteLength;
 }
 
+/**
+ * Bytes of keepalive request bodies in flight on this page, across every
+ * tracker: the browser's 64 KiB limit is per page, not per tracker.
+ */
+let keepaliveInFlight = 0;
+
 /** Split by the server's per-request name count and the encoded body limit. */
-function chunkNames(names: string[]): { names: string[]; bytes: number }[] {
+function chunkNames(names: string[], maxBytes: number): { names: string[]; bytes: number }[] {
   const chunks: { names: string[]; bytes: number }[] = [];
   let current: string[] = [];
   let currentBytes = 2; // []
@@ -98,7 +108,7 @@ function chunkNames(names: string[]): { names: string[]; bytes: number }[] {
     const added = jsonBytes(name) + (current.length > 0 ? 1 : 0);
     if (
       current.length > 0 &&
-      (current.length >= USAGE_MAX_NAMES_PER_REQUEST || currentBytes + added > USAGE_MAX_BODY_BYTES)
+      (current.length >= USAGE_MAX_NAMES_PER_REQUEST || currentBytes + added > maxBytes)
     ) {
       chunks.push({ names: current, bytes: currentBytes });
       current = [];
@@ -143,8 +153,6 @@ export class UsageTracker {
   private warnedCap = false;
   private warnedLongName = false;
   private removeExitListeners: (() => void) | undefined;
-  /** Bytes of keepalive request bodies still in flight (browsers cap the total). */
-  private keepaliveInFlight = 0;
   /** Resource stores this tracker is attached to, counted per backend. */
   attachments = 0;
 
@@ -292,6 +300,10 @@ export class UsageTracker {
     if (this.stopped) return;
     if (this.timer !== undefined) clearTimeout(this.timer);
     this.timer = undefined;
+    // Listeners go now, not when the send settles: a process re-initializing
+    // backends quickly would otherwise pile them up meanwhile.
+    this.removeExitListeners?.();
+    this.removeExitListeners = undefined;
     try {
       await this.send('exit');
     } catch (error) {
@@ -321,8 +333,9 @@ export class UsageTracker {
   }
 
   private takePending(): void {
+    const maxBytes = isBrowserPage() ? KEEPALIVE_BUDGET_BYTES : USAGE_MAX_BODY_BYTES;
     for (const [namespace, names] of this.pending) {
-      for (const chunk of chunkNames(names)) {
+      for (const chunk of chunkNames(names, maxBytes)) {
         this.batches.push({ namespace, ...chunk, attempts: 0, round: 0 });
       }
     }
@@ -341,7 +354,7 @@ export class UsageTracker {
       // chance. Bodies within the keepalive budget outlive the page.
       const batches = this.batches.splice(0);
       let keepaliveBudget =
-        mode === 'pagehide' ? KEEPALIVE_BUDGET_BYTES - this.keepaliveInFlight : 0;
+        mode === 'pagehide' ? KEEPALIVE_BUDGET_BYTES - keepaliveInFlight : 0;
       await Promise.all(
         batches.map((batch) => {
           const keepalive = batch.bytes <= keepaliveBudget;
@@ -363,7 +376,7 @@ export class UsageTracker {
       // closed while it is in flight still delivers it: the page-hide flush
       // only sends what is still queued.
       const keepalive =
-        isBrowserPage() && batch!.bytes <= KEEPALIVE_BUDGET_BYTES - this.keepaliveInFlight;
+        isBrowserPage() && batch!.bytes <= KEEPALIVE_BUDGET_BYTES - keepaliveInFlight;
       await this.post(batch!, round, keepalive);
     }
   }
@@ -371,7 +384,7 @@ export class UsageTracker {
   private async post(batch: Batch, round: number, keepalive: boolean): Promise<void> {
     const url = usedUrl(this.config.apiBaseUrl, this.config.projectSlug, batch.namespace);
     let response: Response;
-    if (keepalive) this.keepaliveInFlight += batch.bytes;
+    if (keepalive) keepaliveInFlight += batch.bytes;
     try {
       response = await fetch(url, {
         method: 'POST',
@@ -386,7 +399,7 @@ export class UsageTracker {
       this.retryLater(batch, round, url, error);
       return;
     } finally {
-      if (keepalive) this.keepaliveInFlight -= batch.bytes;
+      if (keepalive) keepaliveInFlight = Math.max(0, keepaliveInFlight - batch.bytes);
     }
     if (response.ok || this.stopped) return;
 
@@ -503,11 +516,15 @@ function retireTracker(tracker: UsageTracker, config: TrackerConfig): void {
 export function resetUsageTracking(): void {
   for (const tracker of trackers.values()) tracker.stop();
   trackers.clear();
+  keepaliveInFlight = 0;
 }
 
 /**
  * The hostname of the page this runs in — a window or a worker — or
- * undefined outside a browser.
+ * undefined where there is none: outside a browser, and in runtimes that
+ * have a `window` without a web address, such as React Native, or pages
+ * without a host, such as `file:` pages in Electron. allowedHosts applies
+ * only to pages with a hostname.
  */
 function browserHostname(): string | undefined {
   const scope =
@@ -519,8 +536,7 @@ function browserHostname(): string | undefined {
         : undefined;
   if (!scope) return undefined;
   const hostname = (scope as { location?: { hostname?: unknown } }).location?.hostname;
-  // A browser page always has a hostname string ('' for file: pages).
-  return typeof hostname === 'string' ? hostname : '';
+  return typeof hostname === 'string' && hostname !== '' ? hostname : undefined;
 }
 
 /**

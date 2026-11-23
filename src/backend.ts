@@ -105,8 +105,11 @@ export class LocalizeBackend implements BackendModule<LocalizeBackendOptions> {
   private flushScheduled = false;
   /** One initialized backend uses one release across every locale/namespace read. */
   private latestVersion: Promise<string> | undefined;
-  /** Unhooks this backend's usage tracking from the store it was attached to. */
-  private detachUsage: (() => void) | undefined;
+  /**
+   * Unhooks this backend's usage tracking, per resource store: one backend
+   * object can serve several i18next instances, each with its own store.
+   */
+  private detachUsage = new WeakMap<object, () => void>();
 
   constructor(services?: Services, options?: LocalizeBackendOptions, i18nextOptions?: InitOptions) {
     // i18next constructs plugin classes with no arguments and calls init()
@@ -119,14 +122,21 @@ export class LocalizeBackend implements BackendModule<LocalizeBackendOptions> {
   init(services: Services, backendOptions: LocalizeBackendOptions, _i18nextOptions: InitOptions): void {
     this.options = validateOptions(backendOptions);
     this.latestVersion = undefined;
-    // A second init() replaces the first one's settings, usage tracking
-    // included. Attach the new settings before detaching the old ones, so
-    // unchanged settings keep their tracker (and what it already reported)
-    // instead of retiring it and starting over.
-    const previous = this.detachUsage;
-    this.detachUsage = this.options.trackUsage
-      ? startUsageTracking(services?.resourceStore, this.options)
+    // A second init() for the same store replaces the first one's settings,
+    // usage tracking included; another i18next instance sharing this backend
+    // object keeps its own. Attach the new settings before detaching the old
+    // ones, so unchanged settings keep their tracker (and what it already
+    // reported) instead of retiring it and starting over.
+    const store: unknown = services?.resourceStore;
+    const storeKey = typeof store === 'object' && store !== null ? store : undefined;
+    const previous = storeKey ? this.detachUsage.get(storeKey) : undefined;
+    const detach = this.options.trackUsage
+      ? startUsageTracking(store, this.options)
       : undefined;
+    if (storeKey) {
+      if (detach) this.detachUsage.set(storeKey, detach);
+      else this.detachUsage.delete(storeKey);
+    }
     previous?.();
   }
 

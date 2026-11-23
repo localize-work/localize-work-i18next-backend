@@ -766,3 +766,113 @@ test('re-initializing with new settings retires the old tracker after sending it
     [['onlyEn']],
   );
 });
+
+test('one backend object serving two i18next instances reports both', async (t) => {
+  const calls = mockFetch();
+  const shared = new LocalizeBackend();
+  const make = async () => {
+    const instance = i18next.createInstance();
+    await instance.use(shared).init({
+      lng: 'et',
+      fallbackLng: 'en',
+      ns: ['common', 'admin'],
+      defaultNS: 'common',
+      backend: { ...devOptions, trackUsage: true },
+    });
+    return instance;
+  };
+  const first = await make();
+  const second = await make();
+  useFakeTimers(t);
+  first.t('a.b');
+  second.t('admin:title');
+  await advance(t, 30_000);
+  assert.deepEqual(
+    calls.map((call) => [call.url.split('/').pop(), call.names]).sort(),
+    [
+      ['admin', ['title']],
+      ['common', ['a.b']],
+    ],
+  );
+});
+
+test('trackers of two projects on one page share the keepalive budget', async () => {
+  const calls = mockFetch();
+  const dom = useBrowser('http://localhost:5173/');
+  const one = await makeI18n();
+  const other = i18next.createInstance();
+  await other.use(LocalizeBackend).init({
+    lng: 'et',
+    fallbackLng: 'en',
+    ns: ['common'],
+    defaultNS: 'common',
+    backend: { ...devOptions, projectSlug: 'other-project', trackUsage: true },
+  });
+  // About 45 KB of JSON per project: the second no longer fits the 60 KiB.
+  for (let i = 0; i < 1_000; i++) {
+    storeOf(one).getResource('et', 'common', `${'k'.repeat(40)}${i}`);
+    storeOf(other).getResource('et', 'common', `${'k'.repeat(40)}${i}`);
+  }
+  dom.window.dispatchEvent(new dom.window.Event('pagehide'));
+  await settle();
+  assert.deepEqual(
+    calls.map((call) => [call.url.split('/').at(-3), call.init.keepalive]),
+    [
+      ['doc-in-pocket', true],
+      ['other-project', undefined],
+    ],
+  );
+});
+
+test('in a browser, batches are cut to fit keepalive', async () => {
+  const calls = mockFetch();
+  const dom = useBrowser('http://localhost:5173/');
+  const instance = await makeI18n();
+  // 1,000 names of about 75 bytes: 75 KB, more than one keepalive request takes.
+  for (let i = 0; i < 1_000; i++) {
+    storeOf(instance).getResource('et', 'common', `${'k'.repeat(70)}${i}`);
+  }
+  dom.window.dispatchEvent(new dom.window.Event('pagehide'));
+  await settle();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0]!.init.keepalive, true, 'the first batch fills the keepalive budget');
+  assert.ok(String(calls[0]!.init.body).length <= 60 * 1024);
+  assert.equal(calls[0]!.names.length + calls[1]!.names.length, 1_000);
+});
+
+test('a retired tracker drops its exit listener before its last send settles', async () => {
+  const pending: ((response: Response) => void)[] = [];
+  mockFetch(() => new Promise<Response>((resolve) => pending.push(resolve)) as unknown as Response);
+  const instance = await makeI18n();
+  const backend = instance.services.backendConnector.backend as LocalizeBackend;
+  const listenersBefore = process.listenerCount('beforeExit');
+  for (let i = 0; i < 12; i++) {
+    instance.t(`key${i}`);
+    backend.init(
+      instance.services,
+      { ...devOptions, apiKey: `pk_test_${i}`, trackUsage: true },
+      {} as InitOptions,
+    );
+  }
+  await settle();
+  assert.ok(pending.length > 0, 'the retired trackers are still sending');
+  assert.ok(process.listenerCount('beforeExit') <= listenersBefore);
+  for (const resolve of pending) resolve(ok());
+  await settle();
+});
+
+test('without a web address (React Native, file: pages) keys are reported when enabled', async (t) => {
+  const calls = mockFetch();
+  for (const scope of [{}, { location: { hostname: '' } }]) {
+    savedGlobals.set('window', (globalThis as Record<string, unknown>).window);
+    (globalThis as Record<string, unknown>).window = scope;
+    resetUsageTracking();
+    calls.length = 0;
+    t.mock.timers.reset();
+    const instance = await makeI18n();
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    instance.t('a.b');
+    await advance(t, 30_000);
+    assert.equal(calls.length, 1, JSON.stringify(scope));
+  }
+});
