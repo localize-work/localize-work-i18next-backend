@@ -236,7 +236,7 @@ await i18next.use(LocalizeBackend).init({
 | `trackUsage` setting | Default | Meaning |
 |---|---|---|
 | `allowedHosts` | `['localhost', '127.0.0.1', '[::1]']` | In a browser, keys are only reported on these hostnames (exact match, no port; IPv6 in brackets, as `location.hostname` gives it). Add your staging host here. A blob: worker or an about:srcdoc or about:blank frame is checked by the hostname of the page that made it (the frame's own origin); a sandboxed frame with an opaque origin is checked by its protocol. A page with an opaque origin (`file:` pages in Electron, `data:` workers) is checked by its protocol: add `'file:'` to report from `file:` pages. Where there is no web address at all — server rendering, a prerender script, React Native — keys are reported whenever `trackUsage` is on, so turn it on only in development and staging builds there. |
-| `flushIntervalMs` | `30000` | How long keys are collected before they are sent (at least `1000`). |
+| `flushIntervalMs` | `30000` | How long keys are collected before they are sent (`1000` to `3600000`, one hour). |
 
 How it works:
 
@@ -244,7 +244,9 @@ How it works:
   `items_other` for a plural, `nav.home` for a nested key — and the server
   maps it to the key in your project. Each key is sent at most once per page
   load, and again if it is still looked up six hours later (a long-running
-  server or tab).
+  server or tab), unless its last report is still waiting to go out. Names
+  over 2,062 bytes of UTF-8 (longer than any key the API stores, plus a
+  plural suffix) are skipped with one warning.
 - Keys are sent per namespace, at most 1,000 per request, every
   `flushIntervalMs` and when the page is hidden or closed. A request still
   unanswered after 30 seconds is abandoned and retried like a network error. In a browser, each
@@ -273,7 +275,8 @@ How it works:
   store and is tracked; one made with `cloneInstance({ forkResourceStore: true })`
   gets a new store the backend never sees, so its lookups are not reported.
   For server rendering, clone without `forkResourceStore`, or create and
-  `init()` an instance per request.
+  `init()` an instance per request: once such an instance is garbage
+  collected, a tracker only it used sends what it queued and is dropped.
 
 More in the docs: https://localize.work/docs/sdk/usage-tracking/
 

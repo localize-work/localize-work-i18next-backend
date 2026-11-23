@@ -235,21 +235,55 @@ test('more than 1000 keys in a namespace are split into requests of 1000', async
   assert.equal(new Set(calls.flatMap((call) => call.names)).size, 2_001);
 });
 
-test('names longer than a maximal plural lookup (526 characters) are skipped with one warning', async (t) => {
+test('names longer than a maximal plural lookup (2,062 bytes) are skipped with one warning', async (t) => {
   const calls = mockFetch();
   const warnings = silenceWarnings(t);
   const instance = await makeI18n();
   useFakeTimers(t);
-  instance.t('x'.repeat(527));
-  instance.t('y'.repeat(600));
-  // A 512-character plural key is looked up as `<key>_ordinal_other` at most.
-  instance.t(`${'z'.repeat(512)}_ordinal_other`);
+  instance.t('x'.repeat(2_063));
+  // 2,062 characters, but 2,063 bytes of UTF-8.
+  instance.t(`é${'y'.repeat(2_061)}`);
+  // An imported key path can be 2,048 bytes; a plural one is looked up as
+  // `<key>_ordinal_other` at most. Long multi-byte names count by bytes.
+  const longest = `${'z'.repeat(2_048)}_ordinal_other`;
+  const imported = `${'é'.repeat(600)}_one`;
+  instance.t(longest);
+  instance.t(imported);
   await advance(t, 30_000);
   assert.deepEqual(
     calls.map((call) => call.names),
-    [[`${'z'.repeat(512)}_ordinal_other`]],
+    [[longest, imported]],
   );
   assert.equal(warnings.length, 1);
+});
+
+test('a name waiting behind rate limits is not queued again when it is re-recorded', async (t) => {
+  let rateLimited = true;
+  const calls = mockFetch(() =>
+    rateLimited ? json({ error: 'rate_limited' }, 429, { 'Retry-After': '3600' }) : ok(),
+  );
+  const instance = await makeI18n();
+  useFakeTimers(t);
+  // Every flush for 13 hours is rate limited; the key is looked up again
+  // after each 6-hour re-send interval meanwhile.
+  for (let hour = 0; hour < 13; hour++) {
+    instance.t('a.b');
+    await advance(t, 60 * 60 * 1000);
+  }
+  rateLimited = false;
+  const limited = calls.length;
+  await advance(t, 60 * 60 * 1000);
+  // One copy delivered, not one per re-send interval.
+  assert.deepEqual(
+    calls.slice(limited).map((call) => call.names),
+    [['a.b']],
+  );
+  // Delivered: a later re-send is queued again.
+  await advance(t, 6 * 60 * 60 * 1000);
+  const before = calls.length;
+  instance.t('a.b');
+  await advance(t, 30_000);
+  assert.equal(calls.length, before + 1);
 });
 
 test('a key still looked up six hours after its report is reported again', async (t) => {
@@ -476,6 +510,12 @@ test('invalid trackUsage settings are init errors', () => {
     () => initBackend({ ...devOptions, trackUsage: { flushIntervalMs: Number.NaN } }),
     /`trackUsage.flushIntervalMs` must be/,
   );
+  // Longer than the hour the API allows for collection before a stamp lags.
+  assert.throws(
+    () => initBackend({ ...devOptions, trackUsage: { flushIntervalMs: 60 * 60 * 1000 + 1 } }),
+    /`trackUsage.flushIntervalMs` must be/,
+  );
+  initBackend({ ...devOptions, trackUsage: { flushIntervalMs: 60 * 60 * 1000 } });
   assert.throws(
     () => initBackend({ ...devOptions, trackUsage: { allowedHosts: 'localhost' } }),
     /`trackUsage.allowedHosts` must be/,
@@ -1070,6 +1110,42 @@ test('without TextEncoder (older React Native) keys are still sent', () => {
         'tracker.stop();',
         'if (sent !== 1) process.exit(2);',
       ].join(' '),
+    ],
+    { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' },
+  );
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('a discarded i18next instance retires its tracker once collected', () => {
+  // Per-request instances with their own settings (here, a project each):
+  // after they are collected, no tracker or exit listener is left behind.
+  const result = spawnSync(
+    process.execPath,
+    [
+      '--expose-gc',
+      '--import',
+      'tsx',
+      '--input-type=module',
+      '--eval',
+      [
+        "globalThis.fetch = async () => new Response('{}', { status: 200 });",
+        "const { default: i18next } = await import('i18next');",
+        "const { LocalizeBackend } = await import('./src/index.ts');",
+        "const before = process.listenerCount('beforeExit');",
+        // In a function, so no binding outlives the request it served.
+        'async function serve(i) {',
+        '  const instance = i18next.createInstance();',
+        "  await instance.use(LocalizeBackend).init({ lng: 'en', resources: { en: { common: { a: 'A' } } }, defaultNS: 'common', partialLoadedLanguages: true,",
+        "    backend: { projectSlug: 'p' + i, cdnBaseUrl: 'https://cdn.example', apiBaseUrl: 'https://api.example', apiKey: 'pk', trackUsage: true } });",
+        "  instance.t('a');",
+        '}',
+        'for (let i = 0; i < 12; i++) await serve(i);',
+        'for (let i = 0; i < 20 && process.listenerCount("beforeExit") > before; i++) {',
+        '  globalThis.gc(); await new Promise((resolve) => setTimeout(resolve, 20));',
+        '}',
+        "const left = process.listenerCount('beforeExit') - before;",
+        'if (left !== 0) { console.error(`listeners left: ${left}`); process.exit(2); }',
+      ].join('\n'),
     ],
     { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' },
   );

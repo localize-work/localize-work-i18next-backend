@@ -83,6 +83,18 @@ class LatestResolutionError extends Error {
 const usageByInstance = new WeakMap<object, () => void>();
 
 /**
+ * Detaches the usage tracking of an i18next instance that was discarded
+ * without another init() (one instance per request on a server), so a
+ * tracker with that instance's settings is retired instead of living, with
+ * its exit listener, as long as the process. Keyed (and unregistered) by the
+ * same `services` object; the held detach function does not reference it.
+ */
+const usageCleanup =
+  typeof FinalizationRegistry === 'function'
+    ? new FinalizationRegistry<() => void>((detach) => detach())
+    : undefined;
+
+/**
  * i18next backend plugin for localize.work.
  *
  * read(): resolves the atomic latest pointer once (unless version-pinned), then
@@ -138,8 +150,11 @@ export class LocalizeBackend implements BackendModule<LocalizeBackendOptions> {
       ? startUsageTracking(store, this.options)
       : undefined;
     if (instanceKey) {
-      if (detach) usageByInstance.set(instanceKey, detach);
-      else usageByInstance.delete(instanceKey);
+      usageCleanup?.unregister(instanceKey);
+      if (detach) {
+        usageByInstance.set(instanceKey, detach);
+        usageCleanup?.register(instanceKey, detach, instanceKey);
+      } else usageByInstance.delete(instanceKey);
     }
     previous?.();
   }

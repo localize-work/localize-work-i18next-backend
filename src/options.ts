@@ -66,8 +66,8 @@ export interface TrackUsageOptions {
    */
   allowedHosts?: string[];
   /**
-   * How long to collect keys before sending them, in milliseconds (at least
-   * 1000). Keys are also sent when the page is hidden or closed.
+   * How long to collect keys before sending them, in milliseconds (1000 to
+   * 3600000, one hour). Keys are also sent when the page is hidden or closed.
    * @default 30000
    */
   flushIntervalMs?: number;
@@ -109,8 +109,12 @@ export interface ResolvedTrackUsage {
 export const DEFAULT_ALLOWED_HOSTS: readonly string[] = ['localhost', '127.0.0.1', '[::1]'];
 export const DEFAULT_FLUSH_INTERVAL_MS = 30_000;
 const MIN_FLUSH_INTERVAL_MS = 1_000;
-/** Longest delay setTimeout honors; larger values fire at once. */
-const MAX_FLUSH_INTERVAL_MS = 2_147_483_647;
+/**
+ * Longest collection time. The API counts a key as unused only when its stamp
+ * is older than the period asked for plus 8 hours, an allowance that covers
+ * the 6-hour re-send, its hourly stamp refresh and one hour of collection.
+ */
+export const MAX_FLUSH_INTERVAL_MS = 60 * 60 * 1000;
 
 const PREFIX = '[@localize-work/i18next-backend]';
 

@@ -19,11 +19,12 @@ import { usedUrl } from './url.js';
 
 const PREFIX = '[@localize-work/i18next-backend]';
 /**
- * Server contract: 1–1000 names per request, each 1–526 characters: the
- * longest key name (512) plus the longest plural suffix (`_ordinal_other`).
+ * Server contract: 1–1000 names per request, each at most 2,062 bytes of
+ * UTF-8: the longest key path the API stores (2,048 bytes, from an import)
+ * plus the longest plural suffix (`_ordinal_other`).
  */
 export const USAGE_MAX_NAMES_PER_REQUEST = 1_000;
-export const USAGE_MAX_NAME_LENGTH = 512 + '_ordinal_other'.length;
+export const USAGE_MAX_NAME_BYTES = 2_048 + '_ordinal_other'.length;
 /** Fastify's default body limit. */
 const USAGE_MAX_BODY_BYTES = 1024 * 1024;
 /**
@@ -162,6 +163,13 @@ export class UsageTracker {
   private lastSweep = 0;
   /** Names recorded since the last flush, per namespace. */
   private pending = new Map<string, string[]>();
+  /**
+   * Every name queued and not yet delivered or dropped (pending, waiting in a
+   * batch, or in flight), per namespace: a name re-recorded while its last
+   * report still waits (say, behind repeated 429s) is not queued twice.
+   */
+  private unsent = new Map<string, Set<string>>();
+  private unsentCount = 0;
   /** Chunks ready to send, including ones waiting for a retry. */
   private batches: Batch[] = [];
   private stopped = false;
@@ -176,6 +184,7 @@ export class UsageTracker {
   private warnedExitWait = false;
   private warnedCap = false;
   private warnedLongName = false;
+  private warnedUnsentCap = false;
   private removeExitListeners: (() => void) | undefined;
   /** Resource stores this tracker is attached to, counted per backend. */
   attachments = 0;
@@ -217,16 +226,35 @@ export class UsageTracker {
     if (recordedAt === undefined) this.seenCount++;
     // No key name contains NUL (the API stores names as PostgreSQL text).
     if (key.includes('\u0000')) return;
-    if (key.length > USAGE_MAX_NAME_LENGTH) {
+    // A UTF-16 code unit is at most 3 bytes: count only names that could be long.
+    if (key.length * 3 > USAGE_MAX_NAME_BYTES && utf8Length(key) > USAGE_MAX_NAME_BYTES) {
       if (!this.warnedLongName) {
         this.warnedLongName = true;
         console.warn(
-          `${PREFIX} trackUsage skips keys longer than ${USAGE_MAX_NAME_LENGTH} characters ` +
+          `${PREFIX} trackUsage skips keys longer than ${USAGE_MAX_NAME_BYTES} bytes ` +
             `(first one in namespace "${namespace}")`,
         );
       }
       return;
     }
+    let unsentNames = this.unsent.get(namespace);
+    // Still waiting from its last report: that report carries it.
+    if (unsentNames?.has(key)) return;
+    if (this.unsentCount >= USAGE_MAX_TRACKED_NAMES) {
+      if (!this.warnedUnsentCap) {
+        this.warnedUnsentCap = true;
+        console.warn(
+          `${PREFIX} trackUsage has ${USAGE_MAX_TRACKED_NAMES} keys waiting to be sent and ignores further ones until they are`,
+        );
+      }
+      return;
+    }
+    if (!unsentNames) {
+      unsentNames = new Set();
+      this.unsent.set(namespace, unsentNames);
+    }
+    unsentNames.add(key);
+    this.unsentCount++;
     let queue = this.pending.get(namespace);
     if (!queue) {
       queue = [];
@@ -288,6 +316,8 @@ export class UsageTracker {
       );
       this.pending.clear();
       this.batches = [];
+      this.unsent.clear();
+      this.unsentCount = 0;
       return;
     }
     this.exitWaits++;
@@ -315,8 +345,20 @@ export class UsageTracker {
     this.seenCount = 0;
     this.pending.clear();
     this.batches = [];
+    this.unsent.clear();
+    this.unsentCount = 0;
     this.removeExitListeners?.();
     this.removeExitListeners = undefined;
+  }
+
+  /** The batch was delivered or dropped: its names may be queued again. */
+  private settle(batch: Batch): void {
+    const names = this.unsent.get(batch.namespace);
+    if (!names) return;
+    for (const name of batch.names) {
+      if (names.delete(name)) this.unsentCount--;
+    }
+    if (names.size === 0) this.unsent.delete(batch.namespace);
   }
 
   /** Send what is queued once, without waiting out rate limits, then stop. */
@@ -428,7 +470,11 @@ export class UsageTracker {
     // Only the status and headers are read. Cancel the body so a response
     // that never finishes cannot hold a connection (and a Node process) open.
     discardBody(response);
-    if (response.ok || this.stopped) return;
+    if (this.stopped) return;
+    if (response.ok) {
+      this.settle(batch);
+      return;
+    }
 
     const { status } = response;
     if (status === 401 || status === 403) {
@@ -454,6 +500,7 @@ export class UsageTracker {
       this.retryLater(batch, round, url, status);
       return;
     }
+    this.settle(batch);
     console.warn(
       `${PREFIX} trackUsage dropped ${batch.names.length} key(s): POST ${url} failed: ${status}`,
     );
@@ -463,6 +510,7 @@ export class UsageTracker {
     if (this.stopped) return;
     batch.attempts++;
     if (batch.attempts >= USAGE_MAX_ATTEMPTS) {
+      this.settle(batch);
       console.warn(
         `${PREFIX} trackUsage dropped ${batch.names.length} key(s): POST ${url} failed after ${USAGE_MAX_ATTEMPTS} attempts:`,
         failure,
