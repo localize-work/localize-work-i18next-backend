@@ -900,11 +900,25 @@ test('pages without a host of their own are checked by the origin they inherit, 
       { allowedHosts: ['staging.shop.example'] },
       true,
     ],
+    // A srcdoc or about:blank frame: location.origin is 'null', the frame's
+    // own origin (window.origin) is inherited.
     [
       'srcdoc frame of a localhost page',
-      { hostname: '', origin: 'http://localhost:5173', protocol: 'about:' },
+      { hostname: '', origin: 'null', protocol: 'about:', scopeOrigin: 'http://localhost:5173' },
       true,
       true,
+    ],
+    [
+      'srcdoc frame of a production page',
+      { hostname: '', origin: 'null', protocol: 'about:', scopeOrigin: 'https://app.shop.example' },
+      true,
+      false,
+    ],
+    [
+      'sandboxed frame',
+      { hostname: '', origin: 'null', protocol: 'about:', scopeOrigin: 'null' },
+      true,
+      false,
     ],
     // Opaque origins report only when their protocol is allowed.
     ['file: page', { hostname: '', origin: 'file://', protocol: 'file:' }, true, false],
@@ -919,8 +933,9 @@ test('pages without a host of their own are checked by the origin they inherit, 
   if (!savedGlobals.has('window')) {
     savedGlobals.set('window', (globalThis as Record<string, unknown>).window);
   }
-  for (const [label, location, trackUsage, reports] of cases) {
-    (globalThis as Record<string, unknown>).window = { location };
+  for (const [label, { scopeOrigin, ...location }, trackUsage, reports] of cases) {
+    (globalThis as Record<string, unknown>).window =
+      scopeOrigin === undefined ? { location } : { location, origin: scopeOrigin };
     resetUsageTracking();
     calls.length = 0;
     t.mock.timers.reset();
@@ -930,6 +945,32 @@ test('pages without a host of their own are checked by the origin they inherit, 
     await advance(t, 30_000);
     assert.equal(calls.length, reports ? 1 : 0, label);
   }
+});
+
+test('the unused response body is cancelled, so an unfinished one holds nothing open', async (t) => {
+  const cancelled: number[] = [];
+  const unfinished = (status: number) =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array([123]));
+        },
+        cancel() {
+          cancelled.push(status);
+        },
+      }),
+      { status },
+    );
+  let status = 200;
+  mockFetch(() => unfinished(status));
+  const instance = await makeI18n({ flushIntervalMs: 1_000 });
+  useFakeTimers(t);
+  instance.t('a.b');
+  await advance(t, 1_000);
+  status = 500;
+  instance.t('nav.home');
+  await advance(t, 1_000);
+  assert.deepEqual(cancelled, [200, 500]);
 });
 
 test('a request left unanswered is abandoned and retried, so reporting goes on', async (t) => {

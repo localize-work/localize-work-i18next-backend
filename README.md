@@ -235,7 +235,7 @@ await i18next.use(LocalizeBackend).init({
 
 | `trackUsage` setting | Default | Meaning |
 |---|---|---|
-| `allowedHosts` | `['localhost', '127.0.0.1', '[::1]']` | In a browser, keys are only reported on these hostnames (exact match, no port; IPv6 in brackets, as `location.hostname` gives it). Add your staging host here. A blob: worker or an about:srcdoc frame is checked by the hostname of the page that made it. A page with an opaque origin (`file:` pages in Electron, `data:` workers) is checked by its protocol: add `'file:'` to report from `file:` pages. Where there is no web address at all — server rendering, a prerender script, React Native — keys are reported whenever `trackUsage` is on, so turn it on only in development and staging builds there. |
+| `allowedHosts` | `['localhost', '127.0.0.1', '[::1]']` | In a browser, keys are only reported on these hostnames (exact match, no port; IPv6 in brackets, as `location.hostname` gives it). Add your staging host here. A blob: worker or an about:srcdoc or about:blank frame is checked by the hostname of the page that made it (the frame's own origin); a sandboxed frame with an opaque origin is checked by its protocol. A page with an opaque origin (`file:` pages in Electron, `data:` workers) is checked by its protocol: add `'file:'` to report from `file:` pages. Where there is no web address at all — server rendering, a prerender script, React Native — keys are reported whenever `trackUsage` is on, so turn it on only in development and staging builds there. |
 | `flushIntervalMs` | `30000` | How long keys are collected before they are sent (at least `1000`). |
 
 How it works:

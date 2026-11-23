@@ -425,6 +425,9 @@ export class UsageTracker {
     } finally {
       if (keepalive) keepaliveInFlight = Math.max(0, keepaliveInFlight - batch.bytes);
     }
+    // Only the status and headers are read. Cancel the body so a response
+    // that never finishes cannot hold a connection (and a Node process) open.
+    discardBody(response);
     if (response.ok || this.stopped) return;
 
     const { status } = response;
@@ -492,6 +495,15 @@ async function fetchWithTimeout(url: string, init: RequestInit): Promise<Respons
     ]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function discardBody(response: Response): void {
+  try {
+    const cancelled = response.body?.cancel();
+    if (cancelled) cancelled.catch(() => {});
+  } catch {
+    // A body already used or locked needs nothing.
   }
 }
 
@@ -597,12 +609,16 @@ function pageHost(): string | undefined {
     protocol?: unknown;
   };
   if (typeof hostname === 'string' && hostname !== '') return hostname;
-  if (typeof origin === 'string' && origin !== 'null') {
+  // The scope's own origin comes first: an about:srcdoc or about:blank frame
+  // has location.origin 'null' while self.origin is the inherited origin. A
+  // blob: worker has the inherited origin on both.
+  for (const candidate of [(scope as { origin?: unknown }).origin, origin]) {
+    if (typeof candidate !== 'string' || candidate === 'null') continue;
     try {
-      const inherited = new URL(origin).hostname;
+      const inherited = new URL(candidate).hostname;
       if (inherited !== '') return inherited;
     } catch {
-      // Not a URL: fall through to the protocol.
+      // Not a URL: try the next, then the protocol.
     }
   }
   return typeof protocol === 'string' && protocol !== '' ? protocol : undefined;
