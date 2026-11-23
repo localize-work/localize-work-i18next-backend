@@ -186,6 +186,8 @@ export class UsageTracker {
   private warnedLongName = false;
   private warnedUnsentCap = false;
   private removeExitListeners: (() => void) | undefined;
+  /** Ends a retire() wait early when the tracker is stopped. */
+  private retireWake: (() => void) | undefined;
   /** Resource stores this tracker is attached to, counted per backend. */
   attachments = 0;
 
@@ -218,16 +220,22 @@ export class UsageTracker {
       }
       return;
     }
-    if (!names) {
-      names = new Map();
-      this.seen.set(namespace, names);
-    }
-    names.set(key, now);
-    if (recordedAt === undefined) this.seenCount++;
+    // Marks the name as reported for USAGE_REPORT_AGAIN_MS. Done only once it
+    // is queued, already waiting, or never sendable: a name turned away by a
+    // full queue is recorded again on its next lookup.
+    const markSeen = () => {
+      if (!names) {
+        names = new Map();
+        this.seen.set(namespace, names);
+      }
+      names.set(key, now);
+      if (recordedAt === undefined) this.seenCount++;
+    };
     // No key name contains NUL (the API stores names as PostgreSQL text).
-    if (key.includes('\u0000')) return;
+    if (key.includes('\u0000')) return markSeen();
     // A UTF-16 code unit is at most 3 bytes: count only names that could be long.
     if (key.length * 3 > USAGE_MAX_NAME_BYTES && utf8Length(key) > USAGE_MAX_NAME_BYTES) {
+      markSeen();
       if (!this.warnedLongName) {
         this.warnedLongName = true;
         console.warn(
@@ -239,7 +247,7 @@ export class UsageTracker {
     }
     let unsentNames = this.unsent.get(namespace);
     // Still waiting from its last report: that report carries it.
-    if (unsentNames?.has(key)) return;
+    if (unsentNames?.has(key)) return markSeen();
     if (this.unsentCount >= USAGE_MAX_TRACKED_NAMES) {
       if (!this.warnedUnsentCap) {
         this.warnedUnsentCap = true;
@@ -249,6 +257,7 @@ export class UsageTracker {
       }
       return;
     }
+    markSeen();
     if (!unsentNames) {
       unsentNames = new Set();
       this.unsent.set(namespace, unsentNames);
@@ -341,6 +350,8 @@ export class UsageTracker {
     this.timer = undefined;
     if (this.exitTimer !== undefined) clearTimeout(this.exitTimer);
     this.exitTimer = undefined;
+    this.retireWake?.();
+    this.retireWake = undefined;
     this.seen.clear();
     this.seenCount = 0;
     this.pending.clear();
@@ -361,7 +372,11 @@ export class UsageTracker {
     if (names.size === 0) this.unsent.delete(batch.namespace);
   }
 
-  /** Send what is queued once, without waiting out rate limits, then stop. */
+  /**
+   * Send what is queued, then stop. A 429 or a failed request is retried like
+   * the exit flush: up to EXIT_MAX_WAITS waits of at most EXIT_MAX_WAIT_MS
+   * each, then what is left is dropped with a warning.
+   */
   async retire(): Promise<void> {
     if (this.stopped) return;
     if (this.timer !== undefined) clearTimeout(this.timer);
@@ -370,12 +385,38 @@ export class UsageTracker {
     // backends quickly would otherwise pile them up meanwhile.
     this.removeExitListeners?.();
     this.removeExitListeners = undefined;
+    retiring.add(this);
     try {
-      await this.send('exit');
-    } catch (error) {
-      console.warn(`${PREFIX} trackUsage failed sending keys:`, error);
+      for (let waits = 0; ; waits++) {
+        try {
+          await this.send('exit');
+        } catch (error) {
+          console.warn(`${PREFIX} trackUsage failed sending keys:`, error);
+        }
+        if (this.stopped || !this.hasWork()) break;
+        const wait = Math.max(this.blockedUntil - Date.now(), USAGE_RATE_LIMIT_MIN_MS);
+        if (waits >= EXIT_MAX_WAITS || wait > EXIT_MAX_WAIT_MS) {
+          const queued =
+            this.batches.reduce((sum, batch) => sum + batch.names.length, 0) +
+            [...this.pending.values()].reduce((sum, names) => sum + names.length, 0);
+          console.warn(
+            `${PREFIX} trackUsage dropped ${queued} key(s) unsent: the API did not take them before tracking ended`,
+          );
+          break;
+        }
+        // Not unref'd: a short script whose instance was collected still
+        // delivers its last keys, within the same bound as the exit flush.
+        await new Promise<void>((resolve) => {
+          this.retireWake = resolve;
+          this.exitTimer = setTimeout(resolve, wait);
+        });
+        this.retireWake = undefined;
+        this.exitTimer = undefined;
+      }
+    } finally {
+      retiring.delete(this);
+      this.stop();
     }
-    this.stop();
   }
 
   private hasWork(): boolean {
@@ -589,6 +630,8 @@ function listenForExit(onExit: (mode: FlushMode) => void): (() => void) | undefi
 
 /** One tracker per project and key, shared by every i18next instance on the page. */
 const trackers = new Map<string, UsageTracker>();
+/** Trackers sending their last queue after leaving the registry. */
+const retiring = new Set<UsageTracker>();
 
 function trackerId(config: TrackerConfig): string {
   return JSON.stringify([
@@ -623,6 +666,7 @@ function retireTracker(tracker: UsageTracker, config: TrackerConfig): void {
 /** Stops and forgets every tracker. For tests. */
 export function resetUsageTracking(): void {
   for (const tracker of trackers.values()) tracker.stop();
+  for (const tracker of retiring) tracker.stop();
   trackers.clear();
   keepaliveInFlight = 0;
 }

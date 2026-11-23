@@ -1151,3 +1151,65 @@ test('a discarded i18next instance retires its tracker once collected', () => {
   );
   assert.equal(result.status, 0, result.stderr);
 });
+
+test('a retired tracker waits out a rate limit before its last send', async (t) => {
+  let limited = true;
+  const calls = mockFetch(() => {
+    if (!limited) return ok();
+    limited = false;
+    return json({ error: 'rate_limited' }, 429, { 'Retry-After': '1' });
+  });
+  silenceWarnings(t);
+  const instance = await makeI18n();
+  const backend = instance.services.backendConnector.backend as LocalizeBackend;
+  useFakeTimers(t);
+  instance.t('a.b');
+  // New settings retire the tracker that holds a.b.
+  backend.init(instance.services, { ...devOptions, apiKey: 'pk_test_rotated', trackUsage: true }, {} as InitOptions);
+  await settle();
+  assert.equal(calls.length, 1, 'the first send was rate limited');
+  await advance(t, 1_000);
+  assert.deepEqual(
+    calls.map((call) => [call.names, (call.init.headers as Record<string, string>).Authorization]),
+    [
+      [['a.b'], 'Bearer pk_test_123'],
+      [['a.b'], 'Bearer pk_test_123'],
+    ],
+    'the retired tracker sends its queue again once the wait is over',
+  );
+});
+
+test('a key turned away by a full queue is recorded on its next lookup', async (t) => {
+  let limited = true;
+  const calls = mockFetch(() =>
+    limited ? json({ error: 'rate_limited' }, 429, { 'Retry-After': '60' }) : ok(),
+  );
+  silenceWarnings(t);
+  const instance = await makeI18n();
+  useFakeTimers(t);
+  const store = storeOf(instance);
+  for (let i = 0; i < 50_000; i++) store.getResource('et', 'common', `k${i}`);
+  // Past the re-report window, with all 50,000 still waiting behind the 429.
+  await advance(t, 6 * 60 * 60_000 + 60_000);
+  store.getResource('et', 'common', 'late');
+  limited = false;
+  // 50 requests of 1,000 names, one after another.
+  for (let i = 0; i < 4; i++) {
+    await advance(t, 120_000);
+    for (let j = 0; j < 5; j++) await settle();
+  }
+  assert.equal(calls.length, 51, 'the backlog drained');
+  // Let the last response settle, so its names leave the queue.
+  for (let j = 0; j < 10; j++) await settle();
+  const delivered = () => calls.filter((call) => call.names.includes('late')).length;
+  assert.equal(delivered(), 0, 'the full queue turned it away');
+  store.getResource('et', 'common', 'late');
+  // The drain's last flush may still be settling: its timer comes after it.
+  for (let i = 0; i < 3; i++) {
+    await advance(t, 60_000);
+    await settle();
+  }
+  assert.equal(delivered(), 1, 'its next lookup queues it');
+  // Keep the instance alive to here: once collected, its tracker retires.
+  assert.ok(instance.isInitialized);
+});

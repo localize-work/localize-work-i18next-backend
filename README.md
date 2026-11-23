@@ -276,7 +276,8 @@ How it works:
   gets a new store the backend never sees, so its lookups are not reported.
   For server rendering, clone without `forkResourceStore`, or create and
   `init()` an instance per request: once such an instance is garbage
-  collected, a tracker only it used sends what it queued and is dropped.
+  collected, a tracker only it used sends what it queued (waiting out a rate
+  limit at most twice, as at process exit) and is dropped.
 
 More in the docs: https://localize.work/docs/sdk/usage-tracking/
 
