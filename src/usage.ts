@@ -127,7 +127,8 @@ export function utf8Length(text: string): number {
   return bytes;
 }
 
-function jsonBytes(value: string): number {
+/** UTF-8 bytes of `value` as a JSON string, without TextEncoder. */
+export function jsonBytes(value: string): number {
   return utf8Length(JSON.stringify(value));
 }
 

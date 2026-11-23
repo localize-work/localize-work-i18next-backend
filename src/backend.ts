@@ -3,7 +3,7 @@ import type { LocalizeBackendOptions, ResolvedOptions } from './options.js';
 import { validateOptions } from './options.js';
 import { retryDelayMs } from './retry.js';
 import { cdnUrl, latestManifestUrl, missingUrl } from './url.js';
-import { startUsageTracking } from './usage.js';
+import { jsonBytes, startUsageTracking } from './usage.js';
 
 const PREFIX = '[@localize-work/i18next-backend]';
 const SAVE_MISSING_MAX_ENTRIES = 1_000;
@@ -17,9 +17,11 @@ interface MissingChunkResult {
   skipped: number;
 }
 
-/** Split by both schema count and Fastify's encoded body limit. */
+/**
+ * Split by both schema count and Fastify's encoded body limit. Bytes are
+ * counted by hand: older React Native (Hermes) has no TextEncoder.
+ */
 function chunkMissingBody(body: Record<string, string>): MissingChunkResult {
-  const encoder = new TextEncoder();
   const chunks: Record<string, string>[] = [];
   let current: Record<string, string> = {};
   let currentEntries = 0;
@@ -35,10 +37,7 @@ function chunkMissingBody(body: Record<string, string>): MissingChunkResult {
       skipped++;
       continue;
     }
-    const entryBytes =
-      encoder.encode(JSON.stringify(key)).byteLength +
-      1 +
-      encoder.encode(JSON.stringify(value)).byteLength;
+    const entryBytes = jsonBytes(key) + 1 + jsonBytes(value);
     const addedBytes = entryBytes + (currentEntries > 0 ? 1 : 0);
     if (
       currentEntries > 0 &&

@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import path from 'node:path';
 import test, { afterEach } from 'node:test';
 import type { InitOptions, ReadCallback, Services } from 'i18next';
 import { LocalizeBackend } from './backend.js';
@@ -290,6 +292,46 @@ test('create chunks by encoded body bytes as well as entry count', async () => {
       'every encoded POST body stays within Fastify bodyLimit',
     );
   }
+});
+
+test('create counts multi-byte text by its UTF-8 size when chunking', async () => {
+  const calls = mockFetch(() => new Response(null, { status: 204 }));
+  const backend = makeBackend(devOptions);
+  // 5,000 characters but 15,000 bytes each: 80 of them pass 1 MiB only in bytes.
+  for (let i = 0; i < 80; i++) {
+    backend.create(['et'], 'common', `euro.${i}`, '€'.repeat(5_000));
+  }
+  await settleMicrotasksAndTimers();
+
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.ok(new TextEncoder().encode(String(call.init?.body)).byteLength <= 1024 * 1024);
+  }
+});
+
+test('create works without TextEncoder (older React Native)', () => {
+  const result = spawnSync(
+    process.execPath,
+    [
+      '--import',
+      'tsx',
+      '--input-type=module',
+      '--eval',
+      [
+        'delete globalThis.TextEncoder;',
+        'const bodies = [];',
+        'globalThis.fetch = async (_url, init) => { bodies.push(init.body); return new Response(null, { status: 204 }); };',
+        "const { LocalizeBackend } = await import('./src/index.ts');",
+        'const backend = new LocalizeBackend();',
+        "backend.init({}, { projectSlug: 'p', cdnBaseUrl: 'https://cdn.example', apiBaseUrl: 'https://api.example', apiKey: 'pk' }, {});",
+        "backend.create(['et'], 'common', 'a.b', 'A');",
+        'await new Promise((resolve) => setTimeout(resolve, 0));',
+        'if (bodies.length !== 1 || bodies[0] !== JSON.stringify({ "a.b": "A" })) { console.error(bodies); process.exit(2); }',
+      ].join(' '),
+    ],
+    { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' },
+  );
+  assert.equal(result.status, 0, result.stderr);
 });
 
 test('create retries a rate-limited chunk using Retry-After', async () => {
