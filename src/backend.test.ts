@@ -320,13 +320,20 @@ test('create works without TextEncoder (older React Native)', () => {
       [
         'delete globalThis.TextEncoder;',
         'const bodies = [];',
-        'globalThis.fetch = async (_url, init) => { bodies.push(init.body); return new Response(null, { status: 204 }); };',
+        'const warnings = [];',
+        'console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };',
+        // A plain object: Node's own Response needs TextEncoder.
+        'globalThis.fetch = async (_url, init) => { bodies.push(init.body); return { ok: true, status: 204, headers: { get: () => null }, body: null }; };',
         "const { LocalizeBackend } = await import('./src/index.ts');",
         'const backend = new LocalizeBackend();',
         "backend.init({}, { projectSlug: 'p', cdnBaseUrl: 'https://cdn.example', apiBaseUrl: 'https://api.example', apiKey: 'pk' }, {});",
         "backend.create(['et'], 'common', 'a.b', 'A');",
-        'await new Promise((resolve) => setTimeout(resolve, 0));',
-        'if (bodies.length !== 1 || bodies[0] !== JSON.stringify({ "a.b": "A" })) { console.error(bodies); process.exit(2); }',
+        // Once every send and retry has settled: one POST, accepted, no warning.
+        'process.once("beforeExit", () => {',
+        '  if (bodies.length !== 1 || bodies[0] !== JSON.stringify({ "a.b": "A" }) || warnings.length > 0) {',
+        '    console.error(JSON.stringify({ bodies, warnings })); process.exitCode = 2;',
+        '  }',
+        '});',
       ].join(' '),
     ],
     { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' },

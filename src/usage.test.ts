@@ -1114,13 +1114,16 @@ test('without TextEncoder (older React Native) keys are still sent', () => {
         'delete globalThis.TextEncoder;',
         'globalThis.window = {};',
         'let sent = 0;',
-        'globalThis.fetch = async () => { sent++; return new Response("{}", { status: 200 }); };',
+        // A plain object: Node's own Response needs TextEncoder.
+        'globalThis.fetch = async () => { sent++; return { ok: true, status: 200, headers: { get: () => null }, body: null }; };',
         "const { UsageTracker } = await import('./src/usage.ts');",
         "const tracker = new UsageTracker({ apiBaseUrl: 'https://api.example', apiKey: 'pk', projectSlug: 'p', flushIntervalMs: 1000 });",
         "tracker.record('common', 'a.b');",
         'await tracker.flush();',
+        // A failed send would be queued again and sent by this flush.
+        'await tracker.flush();',
         'tracker.stop();',
-        'if (sent !== 1) process.exit(2);',
+        'if (sent !== 1) { console.error(`sent ${sent}`); process.exit(2); }',
       ].join(' '),
     ],
     { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' },
