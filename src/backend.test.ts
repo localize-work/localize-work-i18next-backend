@@ -487,3 +487,27 @@ test('declares the callback convention, so i18next neither guesses it nor warns'
   assert.match(posts[0]!.url, /\/en\/common/);
   assert.deepEqual(posts[0]!.body, { 'brand.new': 'Brand new' });
 });
+
+test('create calls the i18next completion callback once, with or without saveMissing configured', async () => {
+  mockFetch(() => json({ hello: 'Hello' }));
+  for (const backend of [
+    { ...baseOptions, version: 'v1' },
+    { ...baseOptions, version: 'v1', apiBaseUrl: 'https://api.localize.work', apiKey: 'lw_pub_test' },
+  ]) {
+    const instance = i18next.createInstance();
+    await instance.use(LocalizeBackend).init({ lng: 'en', ns: ['common'], defaultNS: 'common', backend });
+    const calls: unknown[][] = [];
+    instance.services.backendConnector.saveMissing(['en'], 'common', 'k', 'v', false, {}, (...args: unknown[]) => {
+      calls.push(args);
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]![0], null);
+  }
+});
+
+test('create tolerates the options object older i18next passes in the callback position', () => {
+  const backend = makeBackend({ ...baseOptions, version: 'v1' });
+  assert.doesNotThrow(() =>
+    backend.create(['en'], 'common', 'k', 'v', { isUpdate: false } as unknown as (err: unknown) => void),
+  );
+});

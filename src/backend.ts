@@ -219,7 +219,30 @@ export class LocalizeBackend implements BackendModule<LocalizeBackendOptions> {
     void this.load(options, url, language, namespace, callback);
   }
 
-  create(languages: readonly string[], namespace: string, key: string, fallbackValue: string): void {
+  /**
+   * `callback` is i18next's completion callback under `callbackApi: true`. The
+   * POST is batched and fire-and-forget, so it is called at once, as i18next
+   * did itself when it guessed the convention from this method's arity.
+   */
+  create(
+    languages: readonly string[],
+    namespace: string,
+    key: string,
+    fallbackValue: string,
+    callback?: (err: unknown, data?: unknown) => void,
+  ): void {
+    this.queueMissing(languages, namespace, key, fallbackValue);
+    // i18next before 26.7 ignores callbackApi and, seeing five parameters,
+    // passes its options object here instead of a callback.
+    if (typeof callback === 'function') callback(null);
+  }
+
+  private queueMissing(
+    languages: readonly string[],
+    namespace: string,
+    key: string,
+    fallbackValue: string,
+  ): void {
     const options = this.options;
     if (!options?.saveMissingEnabled) return; // silent no-op without apiBaseUrl+apiKey
     for (const language of languages) {
