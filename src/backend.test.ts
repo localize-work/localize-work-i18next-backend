@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import test, { afterEach } from 'node:test';
-import type { InitOptions, ReadCallback, Services } from 'i18next';
+import i18next, { type InitOptions, type ReadCallback, type Services } from 'i18next';
 import { LocalizeBackend } from './backend.js';
 import type { LocalizeBackendOptions } from './options.js';
 
@@ -438,4 +438,52 @@ test('init rejects an empty version', () => {
 test('exposes the i18next backend module type statically and per instance', () => {
   assert.equal(LocalizeBackend.type, 'backend');
   assert.equal(new LocalizeBackend().type, 'backend');
+});
+
+test('declares the callback convention, so i18next neither guesses it nor warns', async () => {
+  assert.equal(LocalizeBackend.callbackApi, true);
+
+  const posts: { url: string; body: unknown }[] = [];
+  mockFetch((url, init) => {
+    if (init?.method === 'POST') {
+      posts.push({ url, body: JSON.parse(String(init.body)) });
+      return json({ created: 1 });
+    }
+    return json({ hello: 'Hello' });
+  });
+  const messages: string[] = [];
+  const record = (args: unknown[]) => {
+    messages.push(args.map(String).join(' '));
+  };
+  const instance = i18next.createInstance();
+  await instance
+    .use({ type: 'logger', log: record, warn: record, error: record })
+    .use(LocalizeBackend)
+    .init({
+      debug: true,
+      lng: 'en',
+      fallbackLng: 'en',
+      ns: ['common'],
+      defaultNS: 'common',
+      saveMissing: true,
+      backend: {
+        ...baseOptions,
+        version: 'v1',
+        apiBaseUrl: 'https://api.localize.work',
+        apiKey: 'lw_pub_test',
+      },
+    });
+
+  assert.equal(instance.t('hello'), 'Hello');
+  assert.equal(instance.t('brand.new', 'Brand new'), 'Brand new');
+  await settleMicrotasksAndTimers();
+  await settleMicrotasksAndTimers();
+
+  assert.deepEqual(
+    messages.filter((message) => /callbackApi|DEPRECATED/.test(message)),
+    [],
+  );
+  assert.equal(posts.length, 1);
+  assert.match(posts[0]!.url, /\/en\/common/);
+  assert.deepEqual(posts[0]!.body, { 'brand.new': 'Brand new' });
 });

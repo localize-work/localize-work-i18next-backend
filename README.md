@@ -5,7 +5,7 @@ translation JSON straight from the CDN (no server in the request path) and — i
 development only — reports missing keys back to the localize.work API via
 i18next's `saveMissing`.
 
-Works in browsers and Node 18+ (uses global `fetch`, no HTTP dependency).
+Works with i18next 23 to 27, in browsers and Node 18+ (uses global `fetch`, no HTTP dependency; i18next 27 itself needs Node 22+).
 
 ## Install
 

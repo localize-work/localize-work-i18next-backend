@@ -1,6 +1,6 @@
 {
   "name": "@localize-work/i18next-backend",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "i18next backend plugin for localize.work — loads published translation JSON from the CDN, posts missing keys back to the API in development, reports which keys the app uses, and lets translators edit strings in the running app",
   "keywords": [
     "i18next",
@@ -59,12 +59,12 @@
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "i18next": "^23.0.0 || ^24.0.0 || ^25.0.0 || ^26.0.0"
+    "i18next": "^23.0.0 || ^24.0.0 || ^25.0.0 || ^26.0.0 || ^27.0.0"
   },
   "devDependencies": {
     "@types/jsdom": "^30.0.0",
     "@types/node": "^22.15.0",
-    "i18next": "^26.3.6",
+    "i18next": "^27.2.9",
     "jsdom": "^31.0.1",
     "tsup": "^8.5.0",
     "tsx": "^4.19.4",

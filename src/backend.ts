@@ -145,6 +145,12 @@ const usageCleanup =
 export class LocalizeBackend implements BackendModule<LocalizeBackendOptions> {
   static type = 'backend' as const;
   type = 'backend' as const;
+  /**
+   * read() and create() take i18next's callback convention. i18next 26.7+
+   * reads this flag; without it, i18next 27 guesses from the parameter count
+   * and logs a deprecation warning in debug mode. Earlier versions ignore it.
+   */
+  static callbackApi = true as const;
 
   private options: ResolvedOptions | undefined;
   /** Pending missing keys, keyed by `${language}\u0000${namespace}`. */
