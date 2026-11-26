@@ -1,0 +1,50 @@
+# Publishes to npm when a version tag (v0.11.1, ...) is pushed.
+#
+# No npm token: npm's trusted publishing lets this workflow publish
+# @localize-work/i18next-backend because the package's npm settings name this
+# repository and this file (publish.yml). Renaming the file breaks that link.
+#
+# The release is staged: it becomes public only after a maintainer approves it
+# with 2FA (`npm stage approve <id>` or the Staged Packages tab on npmjs.com).
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.0.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: 'https://registry.npmjs.org'
+      # Trusted publishing needs npm 11.5.1+, staged publishing 11.15.0+.
+      - run: npm install -g npm@11
+      - name: Check the tag matches package.json
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $version" >&2
+            exit 1
+          fi
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - run: npm stage publish
