@@ -7,6 +7,8 @@ i18next's `saveMissing`.
 
 Works with i18next 23 to 27, in browsers and Node 18+ (uses global `fetch`, no HTTP dependency; i18next 27 itself needs Node 22+).
 
+It also runs in React Native, Hermes included: it needs only the global `fetch`, and doesn't use `TextEncoder`, `URL` or the DOM, which older Hermes releases lack. In-context editing needs a browser, so don't import `@localize-work/i18next-backend/in-context` in a React Native app. If you turn on key usage tracking there, turn it on only in development builds: an app has no hostname to tell development from production by.
+
 ## Install
 
 ```sh
