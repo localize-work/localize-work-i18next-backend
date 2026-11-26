@@ -118,13 +118,19 @@ text.
 | `queryParameter` | `localize` | The address parameter that turns editing on. |
 
 ```ts
-i18next.init({
+import i18next, { type InitOptions } from 'i18next';
+import type { LocalizeInContextOptions } from '@localize-work/i18next-backend/in-context';
+
+// i18next's option type does not know the plugin's options, so add them here.
+const options: InitOptions & { localizeInContext: LocalizeInContextOptions } = {
   // ...
-  // false switches it off in production builds. Leaving it undefined elsewhere
-  // keeps the default, so editing starts only with ?localize=edit; `true`
+  // `enabled: false` switches it off in production builds. Elsewhere the
+  // default applies, so editing starts only with ?localize=edit; `true`
   // would turn it on for every page load.
-  localizeInContext: { enabled: import.meta.env.PROD ? false : undefined },
-});
+  localizeInContext: import.meta.env.PROD ? { enabled: false } : {},
+};
+
+i18next.init(options);
 ```
 
 Things to know:
