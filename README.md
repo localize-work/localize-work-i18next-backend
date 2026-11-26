@@ -120,7 +120,10 @@ text.
 ```ts
 i18next.init({
   // ...
-  localizeInContext: { enabled: import.meta.env.MODE !== 'production' },
+  // false switches it off in production builds. Leaving it undefined elsewhere
+  // keeps the default, so editing starts only with ?localize=edit; `true`
+  // would turn it on for every page load.
+  localizeInContext: { enabled: import.meta.env.PROD ? false : undefined },
 });
 ```
 
